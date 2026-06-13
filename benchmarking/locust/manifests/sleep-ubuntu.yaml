@@ -1,0 +1,51 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: locust-sleep-ubuntu
+  namespace: monitoring
+  labels:
+    app: locust-sleep-ubuntu
+spec:
+  containers:
+  - name: locust
+    image: us-docker.pkg.dev/smythe-gke-dev/gcr.io/ate-images/locust-test-ubuntu:latest
+    imagePullPolicy: Always
+    command:
+    - "/bin/sh"
+    - "-c"
+    - "while true; do sleep 1000000; done"
+    env:
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+    volumeMounts:
+    - name: servicedns-ca
+      mountPath: /run/servicedns-ca
+      readOnly: true
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+  volumes:
+  - name: servicedns-ca
+    projected:
+      sources:
+      - clusterTrustBundle:
+          signerName: servicedns.podcert.ate.dev/identity
+          labelSelector:
+            matchLabels:
+              podcert.ate.dev/canarying: live
+          path: ca.crt

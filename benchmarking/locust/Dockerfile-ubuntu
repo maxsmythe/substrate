@@ -12,25 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Stage 1: Dependency builder
-FROM python:3.11-slim AS builder
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir --target=/app/deps -r requirements.txt
+FROM ubuntu:24.04
 
-# Stage 2: Distroless runner
-FROM gcr.io/distroless/python3-debian12
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-# Copy the dependencies from builder
-COPY --from=builder /app/deps /app/deps
-# Copy the locust files
+
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir --break-system-packages --target=/app/deps -r requirements.txt
+
 COPY common/ /app/common/
 COPY shapes/ /app/shapes/
 COPY tests/ /app/tests/
 COPY runner.py /app/runner.py
 
-# Set PYTHONPATH to include /app so modules can find each other
 ENV PYTHONPATH=/app:/app/deps
 ENV PYTHONUNBUFFERED=1
-
-
+ENV PATH=/app/deps/bin:$PATH
