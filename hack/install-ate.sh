@@ -101,6 +101,28 @@ function usage() {
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
   echo "  --create-api-authentication-config     Create the default ate-api-server authentication config"
   echo ""
+<<<<<<< HEAD
+=======
+  echo "PostgreSQL store (standalone operations; normally select it with"
+  echo "--deploy-ate-system --store-backend=postgres):"
+  echo ""
+  echo "  --deploy-postgres                      Deploy the single-replica PostgreSQL StatefulSet"
+  echo ""
+  echo "External PostgreSQL (environment variables honored by --store-backend=postgres;"
+  echo "when either of the first two is set, the in-cluster StatefulSet is skipped):"
+  echo ""
+  echo "  ATE_API_POSTGRES_CONNECTION_STRING     DSN for any external PostgreSQL (stored in a Secret;"
+  echo "                                         pair with ATE_API_POSTGRES_SERVER_CA_FILE for sslmode=verify-ca)"
+  echo "  ATE_API_POSTGRES_CLOUDSQL_INSTANCE     Cloud SQL instance connection name (project:region:instance)."
+  echo "                                         Deploys the Cloud SQL Auth Proxy sidecar: connector-managed TLS"
+  echo "                                         and automatic IAM database auth, no passwords (see tools/setup-gcp/cloud-sql.md)"
+  echo "  ATE_API_POSTGRES_CLOUDSQL_GSA          GSA email backing Workload Identity + the IAM database user"
+  echo "  ATE_API_POSTGRES_CLOUDSQL_IP_TYPE      private (default) | public | psc"
+  echo "  ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH     true (default) | false (password-over-proxy escape hatch)"
+  echo "  ATE_API_POSTGRES_POOL_MAX_CONNS        pgxpool max connections per ateapi replica (default: max(4, NumCPU))"
+  echo "  ATE_API_POSTGRES_SERVER_CA_FILE        PEM file to mount for verify-ca DSNs (non-Cloud-SQL databases)"
+  echo ""
+>>>>>>> 8e195fe9 (CloudSQL integration)
   echo "Benchmarks (see benchmarking/README.md for details and customization):"
   echo ""
   echo "  --deploy-benchmarks                    Deploy workloads + locust load test stack"
@@ -452,16 +474,95 @@ create_api_server_env_vars() {
     | run_kubectl apply -f -
 
   local postgres_connection_string="${ATE_API_POSTGRES_CONNECTION_STRING:-}"
+<<<<<<< HEAD
   if [[ -z "${postgres_connection_string}" ]]; then
     postgres_connection_string="$(default_postgres_connection_string)"
+=======
+  local cloudsql_instance="${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}"
+  backend="$(store_backend)"
+  if [[ "${backend}" == "postgres" && -z "${postgres_connection_string}" ]]; then
+    if [[ -n "${cloudsql_instance}" ]]; then
+      # Cloud SQL via the Auth Proxy sidecar: ateapi talks plaintext to the
+      # proxy on pod-local loopback; the proxy owns TLS and IAM database
+      # authentication. The database username is the GSA email with the
+      # .gserviceaccount.com suffix trimmed.
+      if [[ -z "${ATE_API_POSTGRES_CLOUDSQL_GSA:-}" ]]; then
+        echo "Error: ATE_API_POSTGRES_CLOUDSQL_INSTANCE requires ATE_API_POSTGRES_CLOUDSQL_GSA" \
+          "(or an explicit ATE_API_POSTGRES_CONNECTION_STRING)" >&2
+        exit 1
+      fi
+      postgres_connection_string="user=${ATE_API_POSTGRES_CLOUDSQL_GSA%.gserviceaccount.com} host=127.0.0.1 port=5432 dbname=atepg sslmode=disable"
+      # pgxpool sizing (per ateapi replica); defaults to max(4, NumCPU).
+      if [[ -n "${ATE_API_POSTGRES_POOL_MAX_CONNS:-}" ]]; then
+        postgres_connection_string+=" pool_max_conns=${ATE_API_POSTGRES_POOL_MAX_CONNS}"
+      fi
+    else
+      postgres_connection_string="$(default_postgres_connection_string)"
+    fi
+>>>>>>> 8e195fe9 (CloudSQL integration)
   fi
 
   echo "POSTGRES_CONNECTION_STRING: ${postgres_connection_string}"
 
+  local cm_args=(
+    --from-literal=ATE_API_REDIS_ADDRESS="${redis_address}"
+    --from-literal=ATE_API_REDIS_USE_IAM_AUTH="${use_iam_auth}"
+    --from-literal=ATE_API_REDIS_TLS_SERVER_NAME="${tls_server_name}"
+    --from-literal=ATE_API_REDIS_CLIENT_CERT="${client_cert}"
+    --from-literal=ATE_API_STORE_BACKEND="${backend}"
+  )
+  if [[ -n "${cloudsql_instance}" ]]; then
+    # Configuration for the Cloud SQL Auth Proxy sidecar
+    # (manifests/ate-install/cloudsql-proxy-patch.yaml). The proxy reads any
+    # of its flags from CSQL_PROXY_* env vars; the instance connection name
+    # is expanded into its args from this ConfigMap. Health checks listen on
+    # 9801 because ateapi's metrics own 9090.
+    cm_args+=(
+      --from-literal=ATE_API_POSTGRES_CLOUDSQL_INSTANCE="${cloudsql_instance}"
+      --from-literal=CSQL_PROXY_AUTO_IAM_AUTHN="${ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH:-true}"
+      --from-literal=CSQL_PROXY_PORT="5432"
+      --from-literal=CSQL_PROXY_HEALTH_CHECK="true"
+      --from-literal=CSQL_PROXY_HTTP_ADDRESS="0.0.0.0"
+      --from-literal=CSQL_PROXY_HTTP_PORT="9801"
+      --from-literal=CSQL_PROXY_STRUCTURED_LOGS="true"
+    )
+    case "${ATE_API_POSTGRES_CLOUDSQL_IP_TYPE:-private}" in
+      private) cm_args+=(--from-literal=CSQL_PROXY_PRIVATE_IP="true") ;;
+      psc) cm_args+=(--from-literal=CSQL_PROXY_PSC="true") ;;
+      public) ;;
+      *)
+        echo "Error: ATE_API_POSTGRES_CLOUDSQL_IP_TYPE must be private, public, or psc, got '${ATE_API_POSTGRES_CLOUDSQL_IP_TYPE}'" >&2
+        exit 1
+        ;;
+    esac
+  fi
   run_kubectl create configmap -n ate-system ate-api-server-envvars \
+<<<<<<< HEAD
+=======
+    "${cm_args[@]}" \
+    --dry-run=client -o yaml \
+    | run_kubectl apply -f -
+
+  # The Postgres DSN may carry a password (external databases without IAM
+  # auth), so it lives in a Secret, not the ConfigMap above. The deployment
+  # lists the secretRef after the configMapRef, so this value wins if both
+  # define the key.
+  run_kubectl create secret generic -n ate-system ate-api-server-secret-envvars \
+>>>>>>> 8e195fe9 (CloudSQL integration)
     --from-literal=ATE_API_POSTGRES_CONNECTION_STRING="${postgres_connection_string}" \
     --dry-run=client -o yaml \
     | run_kubectl apply -f -
+
+  # Server CA for an external Postgres, mounted by the deployment at
+  # /run/postgres-server-ca/server-ca.pem for sslmode=verify-ca DSNs. For
+  # Cloud SQL: gcloud sql ssl server-ca-certs list --instance=<name> \
+  #   --format="value(cert)" > server-ca.pem
+  if [[ -n "${ATE_API_POSTGRES_SERVER_CA_FILE:-}" ]]; then
+    run_kubectl create secret generic -n ate-system postgres-server-ca \
+      --from-file=server-ca.pem="${ATE_API_POSTGRES_SERVER_CA_FILE}" \
+      --dry-run=client -o yaml \
+      | run_kubectl apply -f -
+  fi
 }
 
 apply_podcert_workers_override() {
@@ -570,6 +671,7 @@ deploy_ate_system() {
 
   wait_for_podcertificate_trust_bundles
 
+<<<<<<< HEAD
   # CSI setup must run after podcertificate-controller is ready and trust bundles
   # exist. The ghostunnel sidecar uses projected podCertificate and clusterTrustBundle
   # volumes which cannot be fulfilled until podcertcontroller is actively signing,
@@ -580,12 +682,24 @@ deploy_ate_system() {
     else
       echo "Warning: CSI setup is only supported for Kind local installations. Skipping."
     fi
+=======
+  # The existing Kind and token-client overlays include Valkey but do not
+  # include the opt-in PostgreSQL manifest. Apply PostgreSQL explicitly when
+  # selected so backend configuration and deployed resources cannot diverge.
+  # Store-specific overlay composition can remove the unused Valkey resources
+  # in a separate change.
+  # An externally provided database — a DSN or a Cloud SQL instance —
+  # replaces the in-cluster PostgreSQL, so skip deploying it in that case.
+  if [[ "$(store_backend)" == "postgres" && -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
+    run_kubectl apply -f manifests/ate-install/postgres.yaml
+>>>>>>> 8e195fe9 (CloudSQL integration)
   fi
 
   local manifests=""
   manifests="$(render_ate_system_manifests)"
   echo "${manifests}" | run_kubectl apply -f -
 
+<<<<<<< HEAD
   # Applied on its own rather than through the overlay above, so
   # --experimental-use-sdsmint composes with every overlay instead of needing a
   # variant of each.
@@ -602,6 +716,26 @@ deploy_ate_system() {
 
   # After the bundle, which carries its own copy of ate-otel-config.
   apply_otel_endpoint_override
+=======
+  reconcile_cloudsql_proxy_sidecar
+
+  log_step "Waiting for ATE system components to be ready..."
+  case "$(store_backend)" in
+    redis)
+      run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
+      ;;
+    postgres)
+      if [[ -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
+        run_kubectl rollout status statefulset/postgres -n ate-system --timeout=120s
+      fi
+      ;;
+  esac
+  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
+  run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
+>>>>>>> 8e195fe9 (CloudSQL integration)
 }
 
 # Ensure secrets and configmaps required by ate-apiserver
@@ -636,7 +770,40 @@ deploy_ate_apiserver() {
   apply_otel_endpoint_override
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
+<<<<<<< HEAD
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout="$(rollout_timeout)"
+=======
+  reconcile_cloudsql_proxy_sidecar
+  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
+>>>>>>> 8e195fe9 (CloudSQL integration)
+}
+
+# Reconciles the Cloud SQL Auth Proxy sidecar and Workload Identity
+# annotation on ate-api-server. Runs after the deployment manifest is
+# applied: patches the sidecar in when ATE_API_POSTGRES_CLOUDSQL_INSTANCE is
+# set, and removes it (and the annotation) when it is not. Kept out of the
+# base manifest so non-GCP installations carry no Cloud SQL configuration.
+reconcile_cloudsql_proxy_sidecar() {
+  if [[ -n "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
+    log_step "reconcile_cloudsql_proxy_sidecar (add)"
+    # Workload Identity: the proxy resolves the pod's ambient credentials via
+    # ADC, which requires the KSA to be linked to the GSA that is the Cloud
+    # SQL IAM database user.
+    if [[ -n "${ATE_API_POSTGRES_CLOUDSQL_GSA:-}" ]]; then
+      run_kubectl annotate serviceaccount ate-api-server -n ate-system \
+        "iam.gke.io/gcp-service-account=${ATE_API_POSTGRES_CLOUDSQL_GSA}" --overwrite
+    fi
+    run_kubectl patch deployment ate-api-server -n ate-system \
+      --patch-file manifests/ate-install/cloudsql-proxy-patch.yaml
+  elif run_kubectl get deployment ate-api-server -n ate-system \
+      -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null \
+      | grep -qw cloud-sql-proxy; then
+    log_step "reconcile_cloudsql_proxy_sidecar (remove)"
+    run_kubectl patch deployment ate-api-server -n ate-system --type=strategic \
+      -p '{"spec":{"template":{"spec":{"initContainers":[{"name":"cloud-sql-proxy","$patch":"delete"}]}}}}'
+    run_kubectl annotate serviceaccount ate-api-server -n ate-system \
+      "iam.gke.io/gcp-service-account-" >/dev/null 2>&1 || true
+  fi
 }
 
 deploy_atelet() {
