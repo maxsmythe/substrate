@@ -101,8 +101,6 @@ function usage() {
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
   echo "  --create-api-authentication-config     Create the default ate-api-server authentication config"
   echo ""
-<<<<<<< HEAD
-=======
   echo "PostgreSQL store (standalone operations; normally select it with"
   echo "--deploy-ate-system --store-backend=postgres):"
   echo ""
@@ -122,7 +120,6 @@ function usage() {
   echo "  ATE_API_POSTGRES_POOL_MAX_CONNS        pgxpool max connections per ateapi replica (default: max(4, NumCPU))"
   echo "  ATE_API_POSTGRES_SERVER_CA_FILE        PEM file to mount for verify-ca DSNs (non-Cloud-SQL databases)"
   echo ""
->>>>>>> 8e195fe9 (CloudSQL integration)
   echo "Benchmarks (see benchmarking/README.md for details and customization):"
   echo ""
   echo "  --deploy-benchmarks                    Deploy workloads + locust load test stack"
@@ -474,10 +471,6 @@ create_api_server_env_vars() {
     | run_kubectl apply -f -
 
   local postgres_connection_string="${ATE_API_POSTGRES_CONNECTION_STRING:-}"
-<<<<<<< HEAD
-  if [[ -z "${postgres_connection_string}" ]]; then
-    postgres_connection_string="$(default_postgres_connection_string)"
-=======
   local cloudsql_instance="${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}"
   backend="$(store_backend)"
   if [[ "${backend}" == "postgres" && -z "${postgres_connection_string}" ]]; then
@@ -499,7 +492,6 @@ create_api_server_env_vars() {
     else
       postgres_connection_string="$(default_postgres_connection_string)"
     fi
->>>>>>> 8e195fe9 (CloudSQL integration)
   fi
 
   echo "POSTGRES_CONNECTION_STRING: ${postgres_connection_string}"
@@ -537,8 +529,6 @@ create_api_server_env_vars() {
     esac
   fi
   run_kubectl create configmap -n ate-system ate-api-server-envvars \
-<<<<<<< HEAD
-=======
     "${cm_args[@]}" \
     --dry-run=client -o yaml \
     | run_kubectl apply -f -
@@ -548,7 +538,6 @@ create_api_server_env_vars() {
   # lists the secretRef after the configMapRef, so this value wins if both
   # define the key.
   run_kubectl create secret generic -n ate-system ate-api-server-secret-envvars \
->>>>>>> 8e195fe9 (CloudSQL integration)
     --from-literal=ATE_API_POSTGRES_CONNECTION_STRING="${postgres_connection_string}" \
     --dry-run=client -o yaml \
     | run_kubectl apply -f -
@@ -671,7 +660,6 @@ deploy_ate_system() {
 
   wait_for_podcertificate_trust_bundles
 
-<<<<<<< HEAD
   # CSI setup must run after podcertificate-controller is ready and trust bundles
   # exist. The ghostunnel sidecar uses projected podCertificate and clusterTrustBundle
   # volumes which cannot be fulfilled until podcertcontroller is actively signing,
@@ -682,7 +670,8 @@ deploy_ate_system() {
     else
       echo "Warning: CSI setup is only supported for Kind local installations. Skipping."
     fi
-=======
+  fi
+
   # The existing Kind and token-client overlays include Valkey but do not
   # include the opt-in PostgreSQL manifest. Apply PostgreSQL explicitly when
   # selected so backend configuration and deployed resources cannot diverge.
@@ -692,31 +681,17 @@ deploy_ate_system() {
   # replaces the in-cluster PostgreSQL, so skip deploying it in that case.
   if [[ "$(store_backend)" == "postgres" && -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
     run_kubectl apply -f manifests/ate-install/postgres.yaml
->>>>>>> 8e195fe9 (CloudSQL integration)
   fi
 
   local manifests=""
   manifests="$(render_ate_system_manifests)"
   echo "${manifests}" | run_kubectl apply -f -
 
-<<<<<<< HEAD
   # Applied on its own rather than through the overlay above, so
   # --experimental-use-sdsmint composes with every overlay instead of needing a
   # variant of each.
   ensure_egress_mitm_ca_pool_secret
   apply_atenet_egress
-
-  log_step "Waiting for ATE system components to be ready..."
-  run_kubectl rollout status statefulset/postgres -n ate-system --timeout="$(rollout_timeout)"
-  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout="$(rollout_timeout)"
-  run_kubectl rollout status deployment/ate-controller -n ate-system --timeout="$(rollout_timeout)"
-  run_kubectl rollout status deployment/atenet-router -n ate-system --timeout="$(rollout_timeout)"
-  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout="$(rollout_timeout)"
-  run_kubectl rollout status daemonset/atelet -n ate-system --timeout="$(rollout_timeout)"
-
-  # After the bundle, which carries its own copy of ate-otel-config.
-  apply_otel_endpoint_override
-=======
   reconcile_cloudsql_proxy_sidecar
 
   log_step "Waiting for ATE system components to be ready..."
@@ -735,8 +710,12 @@ deploy_ate_system() {
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
->>>>>>> 8e195fe9 (CloudSQL integration)
+  # After the bundle, which carries its own copy of ate-otel-config.
+  apply_otel_endpoint_override
+
 }
+
+
 
 # Ensure secrets and configmaps required by ate-apiserver
 ensure_apiserver_prerequisites() {
@@ -770,12 +749,7 @@ deploy_ate_apiserver() {
   apply_otel_endpoint_override
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
-<<<<<<< HEAD
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout="$(rollout_timeout)"
-=======
-  reconcile_cloudsql_proxy_sidecar
-  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
->>>>>>> 8e195fe9 (CloudSQL integration)
 }
 
 # Reconciles the Cloud SQL Auth Proxy sidecar and Workload Identity
