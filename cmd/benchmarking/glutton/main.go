@@ -25,8 +25,10 @@ import (
 	"os"
 
 	"github.com/spf13/pflag"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/agent-substrate/substrate/internal/benchmarking/glutton"
+	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/version"
 )
@@ -36,6 +38,13 @@ var (
 	metricsListenAddr = pflag.String("metrics-listen-addr", ":9090", "Address and port the Prometheus metrics server should listen on.")
 	dataDir           = pflag.String("data-dir", "", "Directory under which WriteDisk files are stored. Required.")
 	mode              = pflag.String("mode", glutton.ModeGRPC, "Wire protocol for the main listener: grpc (default) or http.")
+
+	// Test-only knobs: apply an initial UseCPU load at startup without
+	// needing to make an RPC. Remove before merging.
+	testCPUCores    = pflag.Int("test-cpu-cores", 0, "Test only: initial UseCPU num_cores. 0 disables.")
+	testCPUDuty     = pflag.Float64("test-cpu-duty-cycle", 0, "Test only: initial UseCPU duty_cycle in [0, 1].")
+	testCPUCycleMs  = pflag.Int("test-cpu-cycle-ms", 100, "Test only: initial UseCPU cycle length in milliseconds.")
+	testCPUUncapped = pflag.Bool("test-cpu-uncapped", false, "Test only: allow test-cpu-cores to exceed GOMAXPROCS.")
 
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
 )
@@ -78,6 +87,25 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to construct glutton service", err)
 	}
 	defer svc.Close()
+
+	if *testCPUCores > 0 {
+		resp, err := svc.UseCPU(ctx, &gluttonpb.UseCPURequest{
+			NumCores:        int32(*testCPUCores),
+			DutyCycle:       *testCPUDuty,
+			CycleLengthMs:   int32(*testCPUCycleMs),
+			CapAtGomaxprocs: proto.Bool(!*testCPUUncapped),
+		})
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to apply test CPU load", err)
+		}
+		slog.InfoContext(ctx, "Applied test CPU load",
+			slog.Int("requested-cores", *testCPUCores),
+			slog.Int("started-goroutines", int(resp.GetNumCores())),
+			slog.Float64("duty-cycle", *testCPUDuty),
+			slog.Int("cycle-ms", *testCPUCycleMs),
+			slog.Bool("uncapped", *testCPUUncapped),
+		)
+	}
 
 	lis, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
