@@ -43,6 +43,8 @@ type Config struct {
 	CloudSQLEdition   string
 	CloudSQLStorageGB int64
 	CloudSQLGSAName   string
+	CloudSQLCaller    string
+	CloudSQLPSARange  string
 
 	DashboardDir string
 }

@@ -101,13 +101,12 @@ function usage() {
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
   echo "  --create-api-authentication-config     Create the default ate-api-server authentication config"
   echo ""
-  echo "PostgreSQL store (standalone operations; normally select it with"
-  echo "--deploy-ate-system --store-backend=postgres):"
+  echo "PostgreSQL store (standalone operations; normally deployed by --deploy-ate-system):"
   echo ""
   echo "  --deploy-postgres                      Deploy the single-replica PostgreSQL StatefulSet"
   echo ""
-  echo "External PostgreSQL (environment variables honored by --store-backend=postgres;"
-  echo "when either of the first two is set, the in-cluster StatefulSet is skipped):"
+  echo "External PostgreSQL (environment variables; when either of the first two is set,"
+  echo "the in-cluster StatefulSet is skipped):"
   echo ""
   echo "  ATE_API_POSTGRES_CONNECTION_STRING     DSN for any external PostgreSQL (stored in a Secret;"
   echo "                                         pair with ATE_API_POSTGRES_SERVER_CA_FILE for sslmode=verify-ca)"
@@ -472,8 +471,7 @@ create_api_server_env_vars() {
 
   local postgres_connection_string="${ATE_API_POSTGRES_CONNECTION_STRING:-}"
   local cloudsql_instance="${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}"
-  backend="$(store_backend)"
-  if [[ "${backend}" == "postgres" && -z "${postgres_connection_string}" ]]; then
+  if [[ -z "${postgres_connection_string}" ]]; then
     if [[ -n "${cloudsql_instance}" ]]; then
       # Cloud SQL via the Auth Proxy sidecar: ateapi talks plaintext to the
       # proxy on pod-local loopback; the proxy owns TLS and IAM database
@@ -496,16 +494,10 @@ create_api_server_env_vars() {
 
   echo "POSTGRES_CONNECTION_STRING: ${postgres_connection_string}"
 
-  local cm_args=(
-    --from-literal=ATE_API_REDIS_ADDRESS="${redis_address}"
-    --from-literal=ATE_API_REDIS_USE_IAM_AUTH="${use_iam_auth}"
-    --from-literal=ATE_API_REDIS_TLS_SERVER_NAME="${tls_server_name}"
-    --from-literal=ATE_API_REDIS_CLIENT_CERT="${client_cert}"
-    --from-literal=ATE_API_STORE_BACKEND="${backend}"
-  )
+  local cm_args=()
   if [[ -n "${cloudsql_instance}" ]]; then
     # Configuration for the Cloud SQL Auth Proxy sidecar
-    # (manifests/ate-install/cloudsql-proxy-patch.yaml). The proxy reads any
+    # (manifests/ate-install/patches/cloudsql-proxy-sidecar.yaml). The proxy reads any
     # of its flags from CSQL_PROXY_* env vars; the instance connection name
     # is expanded into its args from this ConfigMap. Health checks listen on
     # 9801 because ateapi's metrics own 9090.
@@ -529,7 +521,7 @@ create_api_server_env_vars() {
     esac
   fi
   run_kubectl create configmap -n ate-system ate-api-server-envvars \
-    "${cm_args[@]}" \
+    ${cm_args[@]+"${cm_args[@]}"} \
     --dry-run=client -o yaml \
     | run_kubectl apply -f -
 
@@ -672,14 +664,9 @@ deploy_ate_system() {
     fi
   fi
 
-  # The existing Kind and token-client overlays include Valkey but do not
-  # include the opt-in PostgreSQL manifest. Apply PostgreSQL explicitly when
-  # selected so backend configuration and deployed resources cannot diverge.
-  # Store-specific overlay composition can remove the unused Valkey resources
-  # in a separate change.
   # An externally provided database — a DSN or a Cloud SQL instance —
   # replaces the in-cluster PostgreSQL, so skip deploying it in that case.
-  if [[ "$(store_backend)" == "postgres" && -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
+  if [[ -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
     run_kubectl apply -f manifests/ate-install/postgres.yaml
   fi
 
@@ -695,16 +682,9 @@ deploy_ate_system() {
   reconcile_cloudsql_proxy_sidecar
 
   log_step "Waiting for ATE system components to be ready..."
-  case "$(store_backend)" in
-    redis)
-      run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
-      ;;
-    postgres)
-      if [[ -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
-        run_kubectl rollout status statefulset/postgres -n ate-system --timeout=120s
-      fi
-      ;;
-  esac
+  if [[ -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
+    run_kubectl rollout status statefulset/postgres -n ate-system --timeout=120s
+  fi
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
   run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
@@ -749,6 +729,7 @@ deploy_ate_apiserver() {
   apply_otel_endpoint_override
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
+  reconcile_cloudsql_proxy_sidecar
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout="$(rollout_timeout)"
 }
 
@@ -767,8 +748,19 @@ reconcile_cloudsql_proxy_sidecar() {
       run_kubectl annotate serviceaccount ate-api-server -n ate-system \
         "iam.gke.io/gcp-service-account=${ATE_API_POSTGRES_CLOUDSQL_GSA}" --overwrite
     fi
-    run_kubectl patch deployment ate-api-server -n ate-system \
-      --patch-file manifests/ate-install/cloudsql-proxy-patch.yaml
+    run_kubectl patch deployment ate-api-server -n ate-system --type=strategic \
+      --patch-file manifests/ate-install/patches/cloudsql-proxy-sidecar.yaml
+    # Verify the sidecar actually landed in the deployment spec: a silent
+    # patch no-op (kubectl misparsing the file, wrong resource, wrong
+    # namespace) would otherwise be caught only by ateapi hitting
+    # "connection refused" on 127.0.0.1:5432 at startup.
+    local sidecars=""
+    sidecars="$(run_kubectl get deployment ate-api-server -n ate-system \
+      -o jsonpath='{.spec.template.spec.initContainers[*].name}')"
+    if ! grep -qw cloud-sql-proxy <<<"${sidecars}"; then
+      echo "Error: cloudsql-proxy-sidecar patch did not add the cloud-sql-proxy initContainer (got: '${sidecars}')" >&2
+      exit 1
+    fi
   elif run_kubectl get deployment ate-api-server -n ate-system \
       -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null \
       | grep -qw cloud-sql-proxy; then

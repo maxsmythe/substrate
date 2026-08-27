@@ -1,6 +1,6 @@
 # Cloud SQL for the PostgreSQL store backend
 
-The ateapi PostgreSQL store (`--store-backend=postgres`) can run against
+The ateapi PostgreSQL store can run against
 [Cloud SQL for PostgreSQL](https://cloud.google.com/sql/docs/postgres). The
 supported, most secure configuration uses the
 [Cloud SQL Auth Proxy](https://docs.cloud.google.com/sql/docs/postgres/sql-proxy)
@@ -20,16 +20,16 @@ authentication**](https://docs.cloud.google.com/sql/docs/postgres/iam-authentica
   nothing to store, leak, or rotate; access is revoked in IAM.
 - **Cloud-agnostic code** — ateapi itself knows nothing about Cloud SQL. The
   sidecar is a deployment-time patch
-  (`manifests/ate-install/cloudsql-proxy-patch.yaml`) applied by
+  (`manifests/ate-install/patches/cloudsql-proxy-sidecar.yaml`) applied by
   `hack/install-ate.sh` only when a Cloud SQL instance is configured.
 
 ## 1. Provision
 
 The cluster must have Workload Identity enabled (clusters created by
-`setup-gcp create cluster` do), and the VPC needs [private services
-access](https://cloud.google.com/sql/docs/postgres/configure-private-services-access)
-(one-time per VPC; the tool prints the two `gcloud` commands if it is
-missing). Then:
+`setup-gcp create cluster` do). The VPC also needs [private services
+access](https://cloud.google.com/sql/docs/postgres/configure-private-services-access);
+the tool provisions that per-VPC one-time setup (a `/16` reserved range and
+the servicenetworking peering) itself if missing. Then:
 
 ```sh
 export PROJECT_ID=<project>
@@ -72,15 +72,23 @@ run `psql` from inside the cluster, which is the only place with a network
 path to the instance:
 
 ```sh
-gcloud sql users set-password postgres --instance=<instance> --password='<temp-pw>'
-IP=$(gcloud sql instances describe <instance> --format="value(ipAddresses[0].ipAddress)")
+gcloud sql users set-password postgres --instance=<instance> \
+  --project=<project> --billing-project=<project> --password='<temp-pw>'
+IP=$(gcloud sql instances describe <instance> \
+  --project=<project> --billing-project=<project> \
+  --format="value(ipAddresses[0].ipAddress)")
 kubectl run psql-grant --rm -i --restart=Never --image=postgres:18-alpine -- \
   psql "postgresql://postgres:<temp-pw>@${IP}:5432/atepg?sslmode=require" \
   -c 'GRANT USAGE, CREATE ON SCHEMA public TO "ate-api-server@<project>.iam";'
 ```
 
+`--billing-project=<project>` routes the gcloud API call's quota/billing to
+the same project the cluster and instance live in, so callers whose ADC
+defaults to a different quota project don't hit `serviceusage` errors.
+
 Nothing deployed ever uses this password — afterwards you can scramble it
 (`gcloud sql users set-password postgres --instance=<instance>
+--project=<project> --billing-project=<project>
 --password="$(openssl rand -hex 16)"`) or keep it for admin access such as
 Cloud SQL Studio. Note that `postgres` is not a superuser on Cloud SQL: it
 can list the IAM user's tables but needs explicit `GRANT SELECT` from that
@@ -99,7 +107,7 @@ REASSIGN OWNED BY "<olduser>" TO "ate-api-server@<project>.iam";  -- run inside 
 ```sh
 export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=<project>:<region>:<instance>
 export ATE_API_POSTGRES_CLOUDSQL_GSA=ate-api-server@<project>.iam.gserviceaccount.com
-./hack/install-ate.sh --deploy-ate-system --store-backend=postgres
+./hack/install-ate.sh --deploy-ate-system
 # Existing installation: --deploy-ate-apiserver instead of --deploy-ate-system
 ```
 
@@ -135,7 +143,7 @@ kubectl rollout status deployment/ate-api-server -n ate-system
 kubectl logs deployment/ate-api-server -n ate-system -c cloud-sql-proxy | head
 # expect: "The proxy has started successfully and is ready for new connections"
 kubectl logs deployment/ate-api-server -n ate-system | head -5
-# expect store-backend=postgres in the flag dump and no connection errors
+# expect no connection errors
 kubectl get secret ate-api-server-secret-envvars -n ate-system \
   -o jsonpath='{.data.ATE_API_POSTGRES_CONNECTION_STRING}' | base64 -d
 # expect: no password in the DSN
@@ -170,5 +178,5 @@ server CA and credentials yourself.)
 ```sh
 export ATE_API_POSTGRES_CONNECTION_STRING='postgresql://<user>:<pw>@<host>:5432/atepg?sslmode=verify-ca&sslrootcert=/run/postgres-server-ca/server-ca.pem'
 export ATE_API_POSTGRES_SERVER_CA_FILE=/path/to/server-ca.pem
-./hack/install-ate.sh --deploy-ate-system --store-backend=postgres
+./hack/install-ate.sh --deploy-ate-system
 ```

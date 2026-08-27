@@ -64,7 +64,7 @@ number rather than maximizing.
 The proxy imposes no connection limit and adds
 sub-millisecond latency, but it encrypts all database traffic, so its CPU
 use scales with throughput. The patch
-(`manifests/ate-install/cloudsql-proxy-patch.yaml`) requests `100m` — sized
+(`manifests/ate-install/patches/cloudsql-proxy-sidecar.yaml`) requests `100m` — sized
 for control-plane traffic. For sustained thousands of ops/s, raise the
 sidecar's CPU request so node pressure cannot throttle it into becoming the
 bottleneck. Connection *churn* has a separate ceiling: IAM database logins

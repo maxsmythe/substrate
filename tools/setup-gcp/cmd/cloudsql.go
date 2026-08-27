@@ -19,16 +19,21 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/iam/apiv1/iampb"
 	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
+	"cloud.google.com/go/resourcemanager/apiv3/resourcemanagerpb"
 	serviceusage "cloud.google.com/go/serviceusage/apiv1"
 	"cloud.google.com/go/serviceusage/apiv1/serviceusagepb"
 	"github.com/spf13/cobra"
+	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	iam "google.golang.org/api/iam/v1"
+	oauth2v2 "google.golang.org/api/oauth2/v2"
+	"google.golang.org/api/option"
 	servicenetworking "google.golang.org/api/servicenetworking/v1"
 	sqladmin "google.golang.org/api/sqladmin/v1"
 )
@@ -69,6 +74,68 @@ func isNotFound(err error) bool {
 	return errors.As(err, &gerr) && gerr.Code == 404
 }
 
+// ensureCallerSAAdmin grants roles/iam.serviceAccountAdmin at project
+// scope to the caller so that the later SetIamPolicy on the ate-api-server
+// GSA (Workload Identity binding) succeeds. Idempotent. A per-SA grant
+// would be tighter, but setting a per-SA policy needs
+// iam.serviceAccounts.setIamPolicy — the exact permission this bootstraps.
+// Project IAM Admin (which Cloud SQL operators tend to already have) is
+// enough to add the grant here.
+func ensureCallerSAAdmin(ctx context.Context, cfg *Config) error {
+	member, err := resolveCallerMember(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	client, err := resourcemanager.NewProjectsClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	resource := fmt.Sprintf("projects/%s", cfg.ProjectID)
+	policy, err := client.GetIamPolicy(ctx, &iampb.GetIamPolicyRequest{Resource: resource})
+	if err != nil {
+		return fmt.Errorf("get project iam policy: %w", err)
+	}
+	if !addProjectIamBinding(policy, "roles/iam.serviceAccountAdmin", member) {
+		slog.Info("Caller already has roles/iam.serviceAccountAdmin. Skipping.",
+			slog.String("member", member), slog.String("project", cfg.ProjectID))
+		return nil
+	}
+	slog.Info("Granting caller roles/iam.serviceAccountAdmin at project scope...",
+		slog.String("member", member), slog.String("project", cfg.ProjectID))
+	if _, err := client.SetIamPolicy(ctx, &iampb.SetIamPolicyRequest{Resource: resource, Policy: policy}); err != nil {
+		return fmt.Errorf("set project iam policy: %w", err)
+	}
+	return nil
+}
+
+// resolveCallerMember returns the IAM member string for the identity
+// running the command. cfg.CloudSQLCaller wins if set; otherwise the
+// OAuth2 userinfo endpoint identifies the ADC subject. Emails ending in
+// gserviceaccount.com become serviceAccount:<email>; everything else is
+// user:<email>.
+func resolveCallerMember(ctx context.Context, cfg *Config) (string, error) {
+	if cfg.CloudSQLCaller != "" {
+		return cfg.CloudSQLCaller, nil
+	}
+	svc, err := oauth2v2.NewService(ctx)
+	if err != nil {
+		return "", fmt.Errorf("create oauth2 client (pass --caller to override): %w", err)
+	}
+	info, err := svc.Userinfo.Get().Context(ctx).Do()
+	if err != nil {
+		return "", fmt.Errorf("resolve caller identity via oauth2 userinfo (pass --caller=<user:email|serviceAccount:email> to override): %w", err)
+	}
+	if info.Email == "" {
+		return "", errors.New("caller identity has no email; pass --caller=<user:email|serviceAccount:email>")
+	}
+	prefix := "user:"
+	if strings.HasSuffix(info.Email, "gserviceaccount.com") {
+		prefix = "serviceAccount:"
+	}
+	return prefix + info.Email, nil
+}
+
 // enableCloudSQLAPIs idempotently enables the APIs this command depends on.
 // Scoped here rather than in `enable apis`: Cloud SQL is opt-in, so only its
 // users get these APIs turned on.
@@ -82,8 +149,9 @@ func enableCloudSQLAPIs(ctx context.Context, cfg *Config) error {
 	services := []string{
 		"sqladmin.googleapis.com",
 		"servicenetworking.googleapis.com",
+		"compute.googleapis.com",
 	}
-	slog.Info("Batch enabling services", slog.String("services", strings.Join(services, ", ")))
+	slog.Info("Batch enabling services", slog.String("services", strings.Join(services, ", ")), slog.String("project", cfg.ProjectID))
 	op, err := suClient.BatchEnableServices(ctx, &serviceusagepb.BatchEnableServicesRequest{
 		Parent:     fmt.Sprintf("projects/%s", cfg.ProjectID),
 		ServiceIds: services,
@@ -97,37 +165,143 @@ func enableCloudSQLAPIs(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
-// checkPrivateServicesAccess verifies the VPC has a private services access
-// peering, which Cloud SQL private IP requires. Allocating the range and
-// peering is a rare one-time-per-VPC operation left to gcloud.
-func checkPrivateServicesAccess(ctx context.Context, cfg *Config) error {
-	svc, err := servicenetworking.NewService(ctx)
+// ensurePrivateServicesAccess makes sure the VPC has a private services
+// access peering (Cloud SQL private IP requires it). It reserves a /16
+// range and creates the servicenetworking peering if either is missing.
+// Both operations are per-VPC and idempotent.
+func ensurePrivateServicesAccess(ctx context.Context, cfg *Config) error {
+	snSvc, err := servicenetworking.NewService(ctx)
 	if err != nil {
 		return fmt.Errorf("create servicenetworking client: %w", err)
 	}
-	resp, err := svc.Services.Connections.List("services/servicenetworking.googleapis.com").
+	resp, err := snSvc.Services.Connections.List("services/servicenetworking.googleapis.com").
 		Network(privateNetworkURL(cfg)).Context(ctx).Do()
-	if err == nil && len(resp.Connections) > 0 && len(resp.Connections[0].ReservedPeeringRanges) > 0 {
-		return nil
-	}
 	if err != nil {
-		slog.Warn("Could not list service networking connections", slog.Any("err", err))
+		return fmt.Errorf("list service networking connections: %w", err)
 	}
-	return fmt.Errorf(`network %q has no private services access peering, which Cloud SQL private IP requires. Create it once per VPC:
+	for _, c := range resp.Connections {
+		if len(c.ReservedPeeringRanges) > 0 {
+			slog.Info("Private services access peering already configured. Skipping.",
+				slog.String("network", cfg.Network),
+				slog.String("ranges", strings.Join(c.ReservedPeeringRanges, ",")))
+			return nil
+		}
+	}
 
-  gcloud compute addresses create google-managed-services-%[1]s \
-    --global --purpose=VPC_PEERING --prefix-length=16 --network=%[1]s --project=%[2]s
-  gcloud services vpc-peerings connect \
-    --service=servicenetworking.googleapis.com \
-    --ranges=google-managed-services-%[1]s --network=%[1]s --project=%[2]s`,
-		cfg.Network, cfg.ProjectID)
+	rangeName := "google-managed-services-" + cfg.Network
+	if err := ensurePeeringRange(ctx, cfg, rangeName); err != nil {
+		return err
+	}
+
+	projectNumber, err := resolveProjectNumber(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("resolve project number: %w", err)
+	}
+	slog.Info("Creating service networking connection (VPC peering)...",
+		slog.String("network", cfg.Network), slog.String("range", rangeName))
+	// The connection body requires the network URL with project number, not
+	// project ID; the address reservation above uses project ID because the
+	// compute API accepts either.
+	op, err := snSvc.Services.Connections.Create("services/servicenetworking.googleapis.com",
+		&servicenetworking.Connection{
+			Network:               fmt.Sprintf("projects/%s/global/networks/%s", projectNumber, cfg.Network),
+			ReservedPeeringRanges: []string{rangeName},
+		}).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("create service networking connection: %w", err)
+	}
+	return waitForServiceNetworkingOperation(ctx, snSvc, op)
 }
 
-func waitForSQLOperation(ctx context.Context, svc *sqladmin.Service, cfg *Config, op *sqladmin.Operation) error {
+// ensurePeeringRange reserves the PSA range at a deterministic, GKE-safe
+// address (default 192.168.0.0/16). Auto-allocation would pick from
+// 10.0.0.0/8, which routinely collides with GKE's auto-allocated pod
+// secondary range on large clusters — the resulting overlap silently
+// breaks VPC peering's route advertisement, so pods lose the Cloud SQL
+// return path and every psql call hangs.
+func ensurePeeringRange(ctx context.Context, cfg *Config, rangeName string) error {
+	svc, err := compute.NewService(ctx)
+	if err != nil {
+		return fmt.Errorf("create compute client: %w", err)
+	}
+	address, prefixLength, err := parsePSARange(cfg.CloudSQLPSARange)
+	if err != nil {
+		return err
+	}
+	existing, err := svc.GlobalAddresses.Get(cfg.ProjectID, rangeName).Context(ctx).Do()
+	if err == nil {
+		if existing.Address != address || existing.PrefixLength != prefixLength {
+			slog.Warn("VPC peering range exists with a different range than requested; skipping create. Recreate it manually if pods can't reach Cloud SQL (pod-CIDR overlap risk when the existing range is inside 10.0.0.0/8).",
+				slog.String("range", rangeName),
+				slog.String("existing", fmt.Sprintf("%s/%d", existing.Address, existing.PrefixLength)),
+				slog.String("requested", fmt.Sprintf("%s/%d", address, prefixLength)))
+		} else {
+			slog.Info("VPC peering range exists. Skipping create.", slog.String("range", rangeName))
+		}
+		return nil
+	}
+	if !isNotFound(err) {
+		return fmt.Errorf("get global address: %w", err)
+	}
+	slog.Info("Reserving VPC peering range...",
+		slog.String("range", rangeName), slog.String("network", cfg.Network),
+		slog.String("address", fmt.Sprintf("%s/%d", address, prefixLength)))
+	op, err := svc.GlobalAddresses.Insert(cfg.ProjectID, &compute.Address{
+		Name:         rangeName,
+		Purpose:      "VPC_PEERING",
+		AddressType:  "INTERNAL",
+		Address:      address,
+		PrefixLength: prefixLength,
+		Network:      privateNetworkURL(cfg),
+	}).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("reserve global address: %w", err)
+	}
+	return waitForGlobalComputeOperation(ctx, svc, cfg, op)
+}
+
+// parsePSARange splits a CIDR like "192.168.0.0/16" into its address and
+// prefix length for the compute Address insert body.
+func parsePSARange(cidr string) (string, int64, error) {
+	slash := strings.LastIndex(cidr, "/")
+	if slash < 0 {
+		return "", 0, fmt.Errorf("--psa-range %q: want <address>/<prefix>, e.g. 192.168.0.0/16", cidr)
+	}
+	prefix, err := strconv.ParseInt(cidr[slash+1:], 10, 64)
+	if err != nil || prefix < 8 || prefix > 29 {
+		return "", 0, fmt.Errorf("--psa-range %q: prefix must be 8..29", cidr)
+	}
+	return cidr[:slash], prefix, nil
+}
+
+func waitForGlobalComputeOperation(ctx context.Context, svc *compute.Service, cfg *Config, op *compute.Operation) error {
+	name := op.Name
 	for {
 		if op.Status == "DONE" {
 			if op.Error != nil && len(op.Error.Errors) > 0 {
-				return fmt.Errorf("operation %s failed: %s", op.Name, op.Error.Errors[0].Message)
+				return fmt.Errorf("operation %s failed: %s", name, op.Error.Errors[0].Message)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+		var err error
+		op, err = svc.GlobalOperations.Get(cfg.ProjectID, name).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("poll operation %s: %w", name, err)
+		}
+	}
+}
+
+func waitForServiceNetworkingOperation(ctx context.Context, svc *servicenetworking.APIService, op *servicenetworking.Operation) error {
+	name := op.Name
+	for {
+		if op.Done {
+			if op.Error != nil {
+				return fmt.Errorf("operation %s failed: %s", name, op.Error.Message)
 			}
 			return nil
 		}
@@ -137,9 +311,54 @@ func waitForSQLOperation(ctx context.Context, svc *sqladmin.Service, cfg *Config
 		case <-time.After(5 * time.Second):
 		}
 		var err error
-		op, err = svc.Operations.Get(cfg.ProjectID, op.Name).Context(ctx).Do()
+		op, err = svc.Operations.Get(name).Context(ctx).Do()
 		if err != nil {
-			return fmt.Errorf("poll operation %s: %w", op.Name, err)
+			// op is nil here on failure; use the cached name.
+			return fmt.Errorf("poll operation %s: %w", name, err)
+		}
+	}
+}
+
+// resolveProjectNumber returns cfg.ProjectNumber if set, otherwise looks it
+// up from the project ID. The servicenetworking Connection API requires the
+// network URL to use project number.
+func resolveProjectNumber(ctx context.Context, cfg *Config) (string, error) {
+	if cfg.ProjectNumber != "" {
+		return cfg.ProjectNumber, nil
+	}
+	client, err := resourcemanager.NewProjectsClient(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	proj, err := client.GetProject(ctx, &resourcemanagerpb.GetProjectRequest{
+		Name: "projects/" + cfg.ProjectID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("get project: %w", err)
+	}
+	// proj.Name is "projects/<number>".
+	return strings.TrimPrefix(proj.Name, "projects/"), nil
+}
+
+func waitForSQLOperation(ctx context.Context, svc *sqladmin.Service, cfg *Config, op *sqladmin.Operation) error {
+	name := op.Name
+	for {
+		if op.Status == "DONE" {
+			if op.Error != nil && len(op.Error.Errors) > 0 {
+				return fmt.Errorf("operation %s failed: %s", name, op.Error.Errors[0].Message)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+		var err error
+		op, err = svc.Operations.Get(cfg.ProjectID, name).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("poll operation %s: %w", name, err)
 		}
 	}
 }
@@ -147,7 +366,7 @@ func waitForSQLOperation(ctx context.Context, svc *sqladmin.Service, cfg *Config
 // createCloudSQLInstance creates a private-IP PostgreSQL instance with IAM
 // database authentication enabled, or verifies an existing one.
 func createCloudSQLInstance(ctx context.Context, svc *sqladmin.Service, cfg *Config) error {
-	slog.Info("Checking if Cloud SQL instance exists", slog.String("instance", cfg.CloudSQLInstance))
+	slog.Info("Checking if Cloud SQL instance exists", slog.String("instance", cfg.CloudSQLInstance), slog.String("project", cfg.ProjectID))
 	existing, err := svc.Instances.Get(cfg.ProjectID, cfg.CloudSQLInstance).Context(ctx).Do()
 	if err == nil {
 		iamAuthOn := false
@@ -169,7 +388,7 @@ func createCloudSQLInstance(ctx context.Context, svc *sqladmin.Service, cfg *Con
 		return fmt.Errorf("get instance: %w", err)
 	}
 
-	if err := checkPrivateServicesAccess(ctx, cfg); err != nil {
+	if err := ensurePrivateServicesAccess(ctx, cfg); err != nil {
 		return err
 	}
 
@@ -396,7 +615,7 @@ Cloud SQL is provisioned. Two steps remain:
 
      export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=%s:%s:%s
      export ATE_API_POSTGRES_CLOUDSQL_GSA=%s
-     ./hack/install-ate.sh --deploy-ate-system --store-backend=postgres
+     ./hack/install-ate.sh --deploy-ate-system
 
 See tools/setup-gcp/cloud-sql.md for details and verification steps.
 `, dbUser, cfg.ProjectID, cfg.Region, cfg.CloudSQLInstance, gsa)
@@ -410,10 +629,13 @@ var cloudsqlCmd = &cobra.Command{
 			return errors.New("--project-id is required")
 		}
 		ctx := cmd.Context()
+		if err := ensureCallerSAAdmin(ctx, &cfg); err != nil {
+			return err
+		}
 		if err := enableCloudSQLAPIs(ctx, &cfg); err != nil {
 			return err
 		}
-		svc, err := sqladmin.NewService(ctx)
+		svc, err := sqladmin.NewService(ctx, option.WithQuotaProject(cfg.ProjectID))
 		if err != nil {
 			return fmt.Errorf("create sqladmin client: %w", err)
 		}
@@ -445,4 +667,6 @@ func init() {
 	cloudsqlCmd.Flags().Int64Var(&cfg.CloudSQLStorageGB, "storage-size", getEnv("CLOUDSQL_STORAGE_GB", int64(0)), "Data disk size in GB; 0 = Cloud SQL default (10 GB, auto-resizing). PD IOPS scale with size [env: CLOUDSQL_STORAGE_GB]")
 	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLGSAName, "gsa-name", getEnv("CLOUDSQL_GSA_NAME", "ate-api-server"), "Name of the Google service account to create for Workload Identity + IAM database auth [env: CLOUDSQL_GSA_NAME]")
 	cloudsqlCmd.Flags().StringVar(&cfg.Network, "network", getEnv("NETWORK", "default"), "VPC network name (must match the cluster's) [env: NETWORK]")
+	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLCaller, "caller", getEnv("CLOUDSQL_CALLER", ""), "IAM member for the calling identity (user:<email>, serviceAccount:<email>). Auto-detected from ADC if empty; only needed when userinfo lookup fails [env: CLOUDSQL_CALLER]")
+	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLPSARange, "psa-range", getEnv("CLOUDSQL_PSA_RANGE", "192.168.0.0/16"), "CIDR to reserve for private services access (VPC peering). Default lives outside 10.0.0.0/8 to avoid overlap with GKE pod CIDR auto-allocation. Ignored if the peering already exists [env: CLOUDSQL_PSA_RANGE]")
 }

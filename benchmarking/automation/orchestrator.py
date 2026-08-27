@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,14 @@ MANIFESTS_DIR = "/opt/automation/manifests"
 NAMESPACE = "benchmarking"
 
 TEST_TYPES = tuple(TYPES)
+
+# Cloud SQL shape when --cloudsql-network is set. Machine tier follows the
+# setup-gcp convention (db-custom-<vCPU>-<MB_RAM>); the pool_max_conns value
+# is folded into the DSN by install-ate.sh via ATE_API_POSTGRES_POOL_MAX_CONNS
+# and bounds pgxpool connections per ateapi replica.
+CLOUDSQL_TIER = "db-custom-16-49152"  # 16 vCPU, 48 GiB RAM
+CLOUDSQL_STORAGE_GB = 100
+CLOUDSQL_POOL_MAX_CONNS = 32
 
 # Snapshot the process's initial env so apply_config can return to a known
 # baseline before sourcing the next config (avoids stale vars carrying over
@@ -97,6 +106,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--junit-output",
         help="Path to write a JUnit XML report summarizing test results and durations",
+    )
+    p.add_argument(
+        "--cloudsql-network",
+        help="VPC network for the Cloud SQL instance's private IP (must "
+        "match the target cluster's VPC). Setting this enables Cloud SQL: "
+        "the orchestrator provisions a PostgreSQL instance per target "
+        "cluster and points ateapi at it via ATE_API_POSTGRES_CLOUDSQL_INSTANCE.",
+    )
+    p.add_argument(
+        "--cloudsql-gsa-name",
+        default="ate-api-server",
+        help="Google service account name for Cloud SQL Workload Identity + "
+        "IAM database auth. The KSA -> GSA binding is hardcoded to the "
+        "ate-system/ate-api-server KSA, so the default matches that "
+        "(default: ate-api-server).",
+    )
+    p.add_argument(
+        "--cloudsql-instance",
+        default="atepg",
+        help="Cloud SQL instance name to create/reuse (default: atepg).",
     )
     return p.parse_args()
 
@@ -305,6 +334,202 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
         TYPES[ttype].validate(t)
 
 
+def region_from_cluster_location(location: str) -> str:
+    """GKE cluster locations can be a zone (us-central1-c) or a region
+    (us-central1); Cloud SQL wants a region."""
+    parts = location.split("-")
+    if len(parts) >= 3 and len(parts[-1]) == 1:
+        return "-".join(parts[:-1])
+    return location
+
+
+def provision_cloudsql(
+    instance: str, gsa_name: str, network: str
+) -> tuple[str, str]:
+    """Idempotently create the Cloud SQL instance, database, GSA and IAM
+    bindings for the currently-sourced target cluster's project. Returns
+    (instance_connection_name, gsa_email). Relies on PROJECT_ID and
+    CLUSTER_LOCATION from the sourced target-cluster env; setup-gcp uses ADC
+    (the pod's Workload Identity), so no extra gcloud login is required."""
+    project = os.environ["PROJECT_ID"]
+    region = region_from_cluster_location(os.environ["CLUSTER_LOCATION"])
+    # Enable sqladmin via gcloud (gcloud identity) as well as via setup-gcp
+    # (ADC identity) below. The two can differ, and reset_cloudsql_database's
+    # later gcloud sql calls resolve API-enabled state against the gcloud
+    # identity — so we need this to succeed there even if the ADC enable did.
+    run(
+        [
+            "gcloud",
+            "services",
+            "enable",
+            "sqladmin.googleapis.com",
+            f"--project={project}",
+            f"--billing-project={project}",
+        ]
+    )
+    run(
+        [
+            "go",
+            "run",
+            "./tools/setup-gcp",
+            "create",
+            "cloudsql",
+            "--project-id",
+            project,
+            "--region",
+            region,
+            "--instance",
+            instance,
+            "--gsa-name",
+            gsa_name,
+            "--network",
+            network,
+            "--tier",
+            CLOUDSQL_TIER,
+            "--storage-size",
+            str(CLOUDSQL_STORAGE_GB),
+        ]
+    )
+    return (
+        f"{project}:{region}:{instance}",
+        f"{gsa_name}@{project}.iam.gserviceaccount.com",
+    )
+
+
+def delete_cloudsql(instance_connection_name: str) -> None:
+    """Best-effort teardown of a Cloud SQL instance created by
+    provision_cloudsql. Runs at end-of-orchestrator; setup-gcp has no
+    matching delete subcommand, so shell out to gcloud."""
+    project, _, instance_name = instance_connection_name.split(":")
+    print(
+        f"Deleting Cloud SQL instance {instance_name} in project {project}",
+        flush=True,
+    )
+    run_no_check(
+        [
+            "gcloud",
+            "sql",
+            "instances",
+            "delete",
+            instance_name,
+            f"--project={project}",
+            f"--billing-project={project}",
+            "--quiet",
+        ]
+    )
+
+
+def _set_postgres_password(project: str, instance_name: str, password: str) -> None:
+    """gcloud sql users set-password, printed with the password redacted."""
+    print(
+        f"$ gcloud sql users set-password postgres "
+        f"--instance={instance_name} --project={project} "
+        f"--billing-project={project} --password=<redacted>",
+        flush=True,
+    )
+    subprocess.run(
+        [
+            "gcloud",
+            "sql",
+            "users",
+            "set-password",
+            "postgres",
+            f"--instance={instance_name}",
+            f"--project={project}",
+            f"--billing-project={project}",
+            f"--password={password}",
+        ],
+        check=True,
+    )
+
+
+def reset_cloudsql_database(
+    instance_connection_name: str, gsa_email: str
+) -> None:
+    """Drop and recreate the atepg database, then re-grant schema privileges
+    to the IAM database user. Cloud SQL IAM users start with no privileges
+    and PostgreSQL 15+ removed PUBLIC's CREATE on public, so the GRANT is
+    needed both for a fresh instance and after every recreate. Runs from a
+    throwaway pod on the currently-selected test cluster (only network path
+    to the instance's private IP). Uses a fresh temporary password on the
+    built-in postgres user (Cloud SQL leaves it unset by default); scrambles
+    it once the reset completes and keeps it out of logged argv."""
+    project, _, instance_name = instance_connection_name.split(":")
+    db_user = gsa_email.removesuffix(".gserviceaccount.com")
+    temp_pw = secrets.token_urlsafe(24)
+    _set_postgres_password(project, instance_name, temp_pw)
+    try:
+        ip = subprocess.check_output(
+            [
+                "gcloud",
+                "sql",
+                "instances",
+                "describe",
+                instance_name,
+                f"--project={project}",
+                f"--billing-project={project}",
+                "--format=value(ipAddresses[0].ipAddress)",
+            ],
+            text=True,
+        ).strip()
+        pod_name = f"cloudsql-reset-{uuid.uuid4().hex[:8]}"
+        # \c switches DBs mid-session so we can GRANT inside the freshly
+        # created atepg without a second psql invocation. FORCE evicts any
+        # residual connections (there should be none after teardown_substrate,
+        # but be defensive).
+        sql = (
+            "DROP DATABASE IF EXISTS atepg WITH (FORCE);\n"
+            "CREATE DATABASE atepg;\n"
+            "\\c atepg\n"
+            f'GRANT USAGE, CREATE ON SCHEMA public TO "{db_user}";\n'
+        )
+        print(
+            f"$ kubectl run {pod_name} --image=postgres:18-alpine -- "
+            f"psql host={ip} user=postgres dbname=postgres <reset atepg>",
+            flush=True,
+        )
+        subprocess.run(
+            [
+                "kubectl",
+                "run",
+                pod_name,
+                "-n",
+                "default",
+                "--rm",
+                "-i",
+                "--restart=Never",
+                "--quiet",
+                "--image=postgres:18-alpine",
+                "--env",
+                f"PGPASSWORD={temp_pw}",
+                "--command",
+                "--",
+                "psql",
+                f"host={ip} port=5432 user=postgres dbname=postgres sslmode=require",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "-",
+            ],
+            input=sql,
+            text=True,
+            check=True,
+        )
+    finally:
+        # Best-effort scramble so nothing lingers with a known postgres
+        # password. A failure here is worth flagging but must not mask an
+        # earlier exception from the reset itself.
+        try:
+            _set_postgres_password(
+                project, instance_name, secrets.token_urlsafe(24)
+            )
+        except Exception as e:
+            print(
+                f"warning: failed to scramble temporary postgres password: {e}",
+                flush=True,
+            )
+
+
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
     run(["hack/install-ate.sh", "--deploy-ate-system", *(str(a) for a in ate_args)])
 
@@ -480,6 +705,10 @@ def main() -> None:
     # never builds the nighthawk image and vice versa.
     last_target = None
     images: dict[str, str] = {}
+    # Cloud SQL provisioning is idempotent and per-project, so cache the
+    # resulting (instance_connection_name, gsa_email) per target cluster and
+    # replay it on every iteration (apply_target_cluster clears os.environ).
+    cloudsql_cache: dict[str, tuple[str, str]] = {}
     results = []
 
     for i, test in enumerate(tests):
@@ -502,8 +731,21 @@ def main() -> None:
         try:
             if target_cluster != last_target:
                 gcloud_setup_for_target_cluster()
+                if args.cloudsql_network and target_cluster not in cloudsql_cache:
+                    cloudsql_cache[target_cluster] = provision_cloudsql(
+                        args.cloudsql_instance,
+                        args.cloudsql_gsa_name,
+                        args.cloudsql_network,
+                    )
                 images = {}
                 last_target = target_cluster
+            if args.cloudsql_network:
+                instance, gsa_email = cloudsql_cache[target_cluster]
+                os.environ["ATE_API_POSTGRES_CLOUDSQL_INSTANCE"] = instance
+                os.environ["ATE_API_POSTGRES_CLOUDSQL_GSA"] = gsa_email
+                os.environ["ATE_API_POSTGRES_POOL_MAX_CONNS"] = str(
+                    CLOUDSQL_POOL_MAX_CONNS
+                )
             ttype = test_type(test)
             if ttype not in images:
                 images[ttype] = TYPES[ttype].build_image(commit)
@@ -524,7 +766,13 @@ def main() -> None:
             failure_msg = None
             start_time = time.time()
             try:
-                deploy_substrate(test.get("ateArgs", []))
+                # Wipe the DB before deploy so each test starts against a
+                # freshly created atepg with only the schema-level grants
+                # ateapi needs to apply its schema at startup.
+                if args.cloudsql_network:
+                    reset_cloudsql_database(*cloudsql_cache[target_cluster])
+                ate_args = list(test.get("ateArgs", []))
+                deploy_substrate(ate_args)
                 TYPES[ttype].pre_test(test)
                 # install-microvm-deps needs the CRDs from deploy_substrate;
                 # deploy_workloads needs the microvm SandboxConfig.
@@ -560,6 +808,18 @@ def main() -> None:
                 teardown_workloads()
                 teardown_microvm_deps()
                 teardown_substrate()
+                # Post-test DB wipe so no state persists between tests.
+                # Best-effort: a failure here shouldn't mask the test's own
+                # failure_msg, and the next test's pre-deploy reset will
+                # cover any residual state.
+                if args.cloudsql_network:
+                    try:
+                        reset_cloudsql_database(*cloudsql_cache[target_cluster])
+                    except Exception as e:
+                        print(
+                            f"Post-test Cloud SQL reset failed: {e}",
+                            flush=True,
+                        )
             duration = time.time() - start_time
             results.append((test["name"], status, duration, failure_msg))
         finally:
@@ -567,6 +827,16 @@ def main() -> None:
             # inherit this one's cluster/project if the next
             # apply_target_cluster fails partway through.
             clear_target_cluster()
+
+    # End-of-run teardown of every Cloud SQL instance provisioned this run.
+    # Runs before the summary/exit so its output stays near the related
+    # provisioning logs. Best-effort: delete_cloudsql uses run_no_check.
+    for target_cluster, (instance, _) in cloudsql_cache.items():
+        print(
+            f"Tearing down Cloud SQL for target cluster {target_cluster}",
+            flush=True,
+        )
+        delete_cloudsql(instance)
 
     print("\n=== summary ===", flush=True)
     failed = 0

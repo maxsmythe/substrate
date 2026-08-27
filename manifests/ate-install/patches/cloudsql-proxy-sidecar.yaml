@@ -47,7 +47,7 @@ spec:
           allowPrivilegeEscalation: false
         resources:
           requests:
-            cpu: 100m
+            cpu: "1"
             memory: 128Mi
         # /startup returns 200 once the proxy can accept connections; gating
         # on it means ateapi never races the tunnel. Health checks listen on
