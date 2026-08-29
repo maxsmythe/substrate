@@ -671,7 +671,7 @@ deploy_ate_system() {
   fi
 
   local manifests=""
-  manifests="$(render_ate_system_manifests)"
+  manifests="$(render_ate_system_manifests | inject_cloudsql_proxy_sidecar)"
   echo "${manifests}" | run_kubectl apply -f -
 
   # Applied on its own rather than through the overlay above, so
@@ -728,45 +728,78 @@ deploy_ate_apiserver() {
   apply_otel_config
   apply_otel_endpoint_override
 
-  run_ko apply -f manifests/ate-install/ate-api-server.yaml
+  run_ko resolve -f manifests/ate-install/ate-api-server.yaml | inject_cloudsql_proxy_sidecar | run_kubectl apply -f -
   reconcile_cloudsql_proxy_sidecar
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout="$(rollout_timeout)"
 }
 
-# Reconciles the Cloud SQL Auth Proxy sidecar and Workload Identity
-# annotation on ate-api-server. Runs after the deployment manifest is
-# applied: patches the sidecar in when ATE_API_POSTGRES_CLOUDSQL_INSTANCE is
-# set, and removes it (and the annotation) when it is not. Kept out of the
-# base manifest so non-GCP installations carry no Cloud SQL configuration.
+# inject_cloudsql_proxy_sidecar reads multi-doc YAML on stdin and, when
+# ATE_API_POSTGRES_CLOUDSQL_INSTANCE is set, merges the Cloud SQL Auth
+# Proxy sidecar spec (patches/cloudsql-proxy-sidecar.yaml) into the
+# ate-api-server Deployment before it's applied to the cluster. Baking the
+# sidecar into the initial apply means the deployment is created correctly
+# on the first roll — no window of sidecar-less pods hitting "connection
+# refused" on 127.0.0.1:5432, and no race between an initial rollout and a
+# post-apply patch's second rollout.
+#
+# TODO: This is a shell-side transform because render_ate_system_manifests
+# uses `ko resolve -f <dir>` for the GKE path rather than kustomize. The
+# right fix is to convert the GKE path to a kustomize base and add an
+# optional cloudsql overlay component (patchesStrategicMerge), so the
+# sidecar composes natively at manifest-render time. That's a larger
+# refactor; this transform keeps the same behavior with a small diff.
+inject_cloudsql_proxy_sidecar() {
+  if [[ -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
+    cat
+    return
+  fi
+  # Read Python script from fd 3 (the heredoc) so python's own stdin stays
+  # bound to the piped multi-doc YAML we're transforming.
+  python3 /dev/fd/3 3<<'PY'
+import sys, yaml
+
+with open("manifests/ate-install/patches/cloudsql-proxy-sidecar.yaml") as f:
+    patch = yaml.safe_load(f)
+init_add = patch["spec"]["template"]["spec"]["initContainers"]
+add_by_name = {c["name"]: c for c in init_add}
+
+docs = list(yaml.safe_load_all(sys.stdin))
+for d in docs:
+    if not d:
+        continue
+    if d.get("kind") != "Deployment":
+        continue
+    if d.get("metadata", {}).get("name") != "ate-api-server":
+        continue
+    spec = d.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
+    existing = spec.setdefault("initContainers", [])
+    kept = [c for c in existing if c.get("name") not in add_by_name]
+    spec["initContainers"] = kept + init_add
+
+yaml.safe_dump_all(
+    [d for d in docs if d],
+    sys.stdout,
+    sort_keys=False,
+    default_flow_style=False,
+)
+PY
+}
+
+# reconcile_cloudsql_proxy_sidecar handles the ate-api-server KSA
+# annotation for Workload Identity: the proxy sidecar resolves the pod's
+# ambient credentials via ADC, which requires the KSA to be linked to the
+# GSA that owns the Cloud SQL IAM database user. The sidecar itself is
+# now injected at manifest-render time by inject_cloudsql_proxy_sidecar.
 reconcile_cloudsql_proxy_sidecar() {
   if [[ -n "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
-    log_step "reconcile_cloudsql_proxy_sidecar (add)"
-    # Workload Identity: the proxy resolves the pod's ambient credentials via
-    # ADC, which requires the KSA to be linked to the GSA that is the Cloud
-    # SQL IAM database user.
+    log_step "reconcile_cloudsql_proxy_sidecar (annotate)"
     if [[ -n "${ATE_API_POSTGRES_CLOUDSQL_GSA:-}" ]]; then
       run_kubectl annotate serviceaccount ate-api-server -n ate-system \
         "iam.gke.io/gcp-service-account=${ATE_API_POSTGRES_CLOUDSQL_GSA}" --overwrite
     fi
-    run_kubectl patch deployment ate-api-server -n ate-system --type=strategic \
-      --patch-file manifests/ate-install/patches/cloudsql-proxy-sidecar.yaml
-    # Verify the sidecar actually landed in the deployment spec: a silent
-    # patch no-op (kubectl misparsing the file, wrong resource, wrong
-    # namespace) would otherwise be caught only by ateapi hitting
-    # "connection refused" on 127.0.0.1:5432 at startup.
-    local sidecars=""
-    sidecars="$(run_kubectl get deployment ate-api-server -n ate-system \
-      -o jsonpath='{.spec.template.spec.initContainers[*].name}')"
-    if ! grep -qw cloud-sql-proxy <<<"${sidecars}"; then
-      echo "Error: cloudsql-proxy-sidecar patch did not add the cloud-sql-proxy initContainer (got: '${sidecars}')" >&2
-      exit 1
-    fi
-  elif run_kubectl get deployment ate-api-server -n ate-system \
-      -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null \
-      | grep -qw cloud-sql-proxy; then
-    log_step "reconcile_cloudsql_proxy_sidecar (remove)"
-    run_kubectl patch deployment ate-api-server -n ate-system --type=strategic \
-      -p '{"spec":{"template":{"spec":{"initContainers":[{"name":"cloud-sql-proxy","$patch":"delete"}]}}}}'
+  else
+    # Best-effort remove: strip the annotation left behind by a previous
+    # Cloud SQL install. Silent no-op if it isn't there.
     run_kubectl annotate serviceaccount ate-api-server -n ate-system \
       "iam.gke.io/gcp-service-account-" >/dev/null 2>&1 || true
   fi
