@@ -32,12 +32,20 @@ rules:
   resources: ["storageclasses"]
   verbs: ["get", "watch", "list"]
 ---
-# Create Service Account for Workload Identity
+# Create Service Account for Workload Identity.
+# The `iam.gke.io/gcp-service-account` annotation binds the KSA to a GSA
+# for classic Workload Identity, which the Cloud SQL Auth Proxy sidecar
+# uses to authenticate to Cloud SQL. install-ate.sh envsubsts
+# ATE_API_POSTGRES_CLOUDSQL_GSA into it before apply; on non-Cloud-SQL
+# installs the variable is unset, the value is empty, and GKE treats an
+# empty annotation as "no mapping" (WI stays inactive).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ate-api-server
   namespace: ate-system
+  annotations:
+    iam.gke.io/gcp-service-account: "${ATE_API_POSTGRES_CLOUDSQL_GSA}"
 ---
 # 4. Bind Identity to Permissions
 apiVersion: rbac.authorization.k8s.io/v1

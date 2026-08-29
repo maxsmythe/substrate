@@ -671,7 +671,10 @@ deploy_ate_system() {
   fi
 
   local manifests=""
-  manifests="$(render_ate_system_manifests | inject_cloudsql_proxy_sidecar)"
+  # envsubst only substitutes the whitelisted variable so any other
+  # ${...} in the YAML (there aren't any today, but be defensive) is
+  # left alone. Unset -> empty string, which GKE reads as "no WI".
+  manifests="$(render_ate_system_manifests | inject_cloudsql_proxy_sidecar | ATE_API_POSTGRES_CLOUDSQL_GSA="${ATE_API_POSTGRES_CLOUDSQL_GSA:-}" envsubst '${ATE_API_POSTGRES_CLOUDSQL_GSA}')"
   echo "${manifests}" | run_kubectl apply -f -
 
   # Applied on its own rather than through the overlay above, so
@@ -679,7 +682,6 @@ deploy_ate_system() {
   # variant of each.
   ensure_egress_mitm_ca_pool_secret
   apply_atenet_egress
-  reconcile_cloudsql_proxy_sidecar
 
   log_step "Waiting for ATE system components to be ready..."
   if [[ -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
@@ -728,8 +730,10 @@ deploy_ate_apiserver() {
   apply_otel_config
   apply_otel_endpoint_override
 
-  run_ko resolve -f manifests/ate-install/ate-api-server.yaml | inject_cloudsql_proxy_sidecar | run_kubectl apply -f -
-  reconcile_cloudsql_proxy_sidecar
+  run_ko resolve -f manifests/ate-install/ate-api-server.yaml \
+    | inject_cloudsql_proxy_sidecar \
+    | ATE_API_POSTGRES_CLOUDSQL_GSA="${ATE_API_POSTGRES_CLOUDSQL_GSA:-}" envsubst '${ATE_API_POSTGRES_CLOUDSQL_GSA}' \
+    | run_kubectl apply -f -
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout="$(rollout_timeout)"
 }
 
@@ -783,26 +787,6 @@ yaml.safe_dump_all(
     default_flow_style=False,
 )
 PY
-}
-
-# reconcile_cloudsql_proxy_sidecar handles the ate-api-server KSA
-# annotation for Workload Identity: the proxy sidecar resolves the pod's
-# ambient credentials via ADC, which requires the KSA to be linked to the
-# GSA that owns the Cloud SQL IAM database user. The sidecar itself is
-# now injected at manifest-render time by inject_cloudsql_proxy_sidecar.
-reconcile_cloudsql_proxy_sidecar() {
-  if [[ -n "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
-    log_step "reconcile_cloudsql_proxy_sidecar (annotate)"
-    if [[ -n "${ATE_API_POSTGRES_CLOUDSQL_GSA:-}" ]]; then
-      run_kubectl annotate serviceaccount ate-api-server -n ate-system \
-        "iam.gke.io/gcp-service-account=${ATE_API_POSTGRES_CLOUDSQL_GSA}" --overwrite
-    fi
-  else
-    # Best-effort remove: strip the annotation left behind by a previous
-    # Cloud SQL install. Silent no-op if it isn't there.
-    run_kubectl annotate serviceaccount ate-api-server -n ate-system \
-      "iam.gke.io/gcp-service-account-" >/dev/null 2>&1 || true
-  fi
 }
 
 deploy_atelet() {
