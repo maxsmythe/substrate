@@ -65,13 +65,16 @@ NAMESPACE = "benchmarking"
 
 TEST_TYPES = tuple(TYPES)
 
-# Cloud SQL shape when --cloudsql-network is set. Machine tier follows the
-# setup-gcp convention (db-custom-<vCPU>-<MB_RAM>); the pool_max_conns value
-# is folded into the DSN by install-ate.sh via ATE_API_POSTGRES_POOL_MAX_CONNS
-# and bounds pgxpool connections per ateapi replica.
-CLOUDSQL_TIER = "db-custom-16-49152"  # 16 vCPU, 48 GiB RAM
-CLOUDSQL_STORAGE_GB = 100
-CLOUDSQL_POOL_MAX_CONNS = 32
+# Cloud SQL shape when --cloudsql-network is set. Enterprise Plus is required
+# for the top perf-optimized tier (fixed db-perf-optimized-N-<vCPU> tiers, no
+# db-custom form), so pin the edition alongside the tier. The pool_max_conns
+# value is folded into the DSN by install-ate.sh via
+# ATE_API_POSTGRES_POOL_MAX_CONNS and bounds pgxpool connections per ateapi
+# replica.
+CLOUDSQL_EDITION = "enterprise-plus"
+CLOUDSQL_TIER = "db-perf-optimized-N-64"  # 64 vCPU, 432 GiB RAM
+CLOUDSQL_STORAGE_GB = 500
+CLOUDSQL_POOL_MAX_CONNS = 128
 
 # Snapshot the process's initial env so apply_config can return to a known
 # baseline before sourcing the next config (avoids stale vars carrying over
@@ -384,6 +387,8 @@ def provision_cloudsql(
             gsa_name,
             "--network",
             network,
+            "--edition",
+            CLOUDSQL_EDITION,
             "--tier",
             CLOUDSQL_TIER,
             "--storage-size",

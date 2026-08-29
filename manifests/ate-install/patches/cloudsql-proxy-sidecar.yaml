@@ -48,7 +48,7 @@ spec:
         resources:
           requests:
             cpu: "1"
-            memory: 128Mi
+            memory: 512Mi
         # /startup returns 200 once the proxy can accept connections; gating
         # on it means ateapi never races the tunnel. Health checks listen on
         # CSQL_PROXY_HTTP_PORT (9801; ateapi's metrics own 9090).
