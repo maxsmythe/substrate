@@ -685,13 +685,13 @@ deploy_ate_system() {
 
   log_step "Waiting for ATE system components to be ready..."
   if [[ -z "${ATE_API_POSTGRES_CONNECTION_STRING:-}" && -z "${ATE_API_POSTGRES_CLOUDSQL_INSTANCE:-}" ]]; then
-    run_kubectl rollout status statefulset/postgres -n ate-system --timeout=120s
+    run_kubectl rollout status statefulset/postgres -n ate-system --timeout=10m
   fi
-  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
-  run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
-  run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
-  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
-  run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=10m
+  run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=10m
+  run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=10m
+  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=10m
+  run_kubectl rollout status daemonset/atelet -n ate-system --timeout=10m
   # After the bundle, which carries its own copy of ate-otel-config.
   apply_otel_endpoint_override
 

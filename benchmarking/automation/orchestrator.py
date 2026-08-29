@@ -530,6 +530,26 @@ def reset_cloudsql_database(
             )
 
 
+def _override_ate_arg(ate_args: list[str], flag: str, value: str) -> list[str]:
+    """Drop every prior occurrence of ``flag`` (both ``--flag=x`` and
+    ``--flag x`` forms) from ``ate_args`` and append ``flag=value``, so
+    the override always wins over whatever tests.yaml supplied."""
+    out: list[str] = []
+    skip_next = False
+    for a in ate_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == flag:
+            skip_next = True
+            continue
+        if a.startswith(flag + "="):
+            continue
+        out.append(a)
+    out.append(f"{flag}={value}")
+    return out
+
+
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
     run(["hack/install-ate.sh", "--deploy-ate-system", *(str(a) for a in ate_args)])
 
@@ -772,6 +792,12 @@ def main() -> None:
                 if args.cloudsql_network:
                     reset_cloudsql_database(*cloudsql_cache[target_cluster])
                 ate_args = list(test.get("ateArgs", []))
+                # TODO TEMPORARY: force the rollout timeout on large-cluster
+                # runs; strip whatever tests.yaml set so the override always
+                # wins. Remove once tests.yaml
+                ate_args = _override_ate_arg(
+                    ate_args, "--rollout-timeout", "20m"
+                )
                 deploy_substrate(ate_args)
                 TYPES[ttype].pre_test(test)
                 # install-microvm-deps needs the CRDs from deploy_substrate;
