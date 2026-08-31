@@ -81,12 +81,26 @@ spec:
     metadata:
       labels:
         app: ate-api-server
+        ate.dev/workloadType: ate-control-plane
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
       # TODO: Add topologySpreadConstraints to spread replicas across nodes and zones.
       serviceAccountName: ate-api-server
+      tolerations:
+      - key: ate.dev/workloadType
+        operator: Equal
+        value: ate-control-plane
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                ate.dev/workloadType: ate-control-plane
+            namespaceSelector: {}
+            topologyKey: kubernetes.io/hostname
       # Budget for the full shutdown sequence: --drain-delay (sized to cover
       # the readinessProbe below reaching NotReady, plus propagation) +
       # --drain-timeout.
@@ -96,7 +110,7 @@ spec:
         image: ko://github.com/agent-substrate/substrate/cmd/ateapi
         resources:
           requests:
-            cpu: "1500m"
+            cpu: "4"
             memory: 2Gi
         args:
           - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
