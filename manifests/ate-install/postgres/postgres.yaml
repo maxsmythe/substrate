@@ -100,7 +100,23 @@ spec:
     metadata:
       labels:
         app: postgres
+        ate.dev/workloadType: ate-control-plane
     spec:
+      nodeSelector:
+        ate.dev/workloadType: ate-control-plane
+      tolerations:
+      - key: ate.dev/workloadType
+        operator: Equal
+        value: ate-control-plane
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                ate.dev/workloadType: ate-control-plane
+            namespaceSelector: {}
+            topologyKey: kubernetes.io/hostname
       securityContext:
         # Group ownership of the projected certificate below, and of the data
         # volume so that a freshly provisioned one is writable. OnRootMismatch
@@ -207,7 +223,7 @@ spec:
         # down to fit a CI runner.
         resources:
           requests:
-            cpu: "2"
+            cpu: "4"
             memory: "1Gi"
           limits:
             cpu: "16"

@@ -136,10 +136,27 @@ spec:
     metadata:
       labels:
         app: podcertificate-controller
+        ate.dev/workloadType: ate-control-plane
     spec:
+      tolerations:
+      - key: ate.dev/workloadType
+        operator: Equal
+        value: ate-control-plane
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                ate.dev/workloadType: ate-control-plane
+            namespaceSelector: {}
+            topologyKey: kubernetes.io/hostname
       containers:
       - name: controller
         image: ko://github.com/agent-substrate/substrate/cmd/podcertcontroller
+        resources:
+          requests:
+            cpu: "4"
         args:
         - --in-cluster=true
         - --sharding-pod-namespace=$(POD_NAMESPACE)
@@ -192,6 +209,7 @@ spec:
       dnsPolicy: Default
       nodeSelector:
         kubernetes.io/os: linux
+        ate.dev/workloadType: ate-control-plane
       restartPolicy: Always
       schedulerName: default-scheduler
       securityContext: {}

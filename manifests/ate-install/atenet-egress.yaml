@@ -222,6 +222,7 @@ spec:
     metadata:
       labels:
         app: atenet-egress
+        ate.dev/workloadType: ate-control-plane
     spec:
       serviceAccountName: atenet-egress
       securityContext:
@@ -229,10 +230,28 @@ spec:
         sysctls:
         - name: net.ipv4.ip_unprivileged_port_start
           value: "0"
+      nodeSelector:
+        ate.dev/workloadType: ate-control-plane
+      tolerations:
+      - key: ate.dev/workloadType
+        operator: Equal
+        value: ate-control-plane
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                ate.dev/workloadType: ate-control-plane
+            namespaceSelector: {}
+            topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 60
       containers:
       - name: envoy
         image: envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4
+        resources:
+          requests:
+            cpu: "4"
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

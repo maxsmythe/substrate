@@ -128,11 +128,27 @@ spec:
     metadata:
       labels:
         app: atenet-router
+        ate.dev/workloadType: ate-control-plane
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
       serviceAccountName: atenet-router
+      nodeSelector:
+        ate.dev/workloadType: ate-control-plane
+      tolerations:
+      - key: ate.dev/workloadType
+        operator: Equal
+        value: ate-control-plane
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                ate.dev/workloadType: ate-control-plane
+            namespaceSelector: {}
+            topologyKey: kubernetes.io/hostname
       # Budget for the full shutdown sequence: --drain-delay (13s, readiness
       # propagation) + the Envoy drain window (~15s) + the derived
       # --drain-timeout (park budget + route timeout + margin, ~20s at
@@ -143,6 +159,9 @@ spec:
       containers:
       - name: atenet-router
         image: ko://github.com/agent-substrate/substrate/cmd/atenet
+        resources:
+          requests:
+            cpu: "4"
         args:
         - "router"
         # Serve the ingress direction only: the ingress ext_proc handler, plus
