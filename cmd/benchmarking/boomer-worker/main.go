@@ -49,12 +49,19 @@ func main() {
 		masterWebPort      = flag.Int("master-web-port", 0, "If non-zero, fetch dynconfig from http://{master-host}:{master-web-port}/boomer-config on each spawn message and fail fatally on error. {master-host} comes from boomer's existing --master-host flag.")
 		configPollInterval = flag.Duration("config-poll-interval", 10*time.Second, "With --master-web-port, also fetch dynconfig on this interval. A spawn message comes only when the number of users or the spawn rate changes, thus a load shape that changes the sample rate alone needs this. Zero stops the polling.")
 		userClass          = flag.String("user-class", "glutton", fmt.Sprintf("Locust user class to run, lowercase; one of %s.", strings.Join(userclass.Names(), "|")))
+		actorsPerUser      = flag.Int("actors-per-user", 1, "Number of actors each user (VU) creates and cycles through in round-robin: on iteration i, the user targets actor i%actors-per-user. Startup creates all actors; shutdown suspends+deletes them.")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
 	// our flag-derived values are usable before that.
 	flag.Parse()
 
 	class := strings.ToLower(*userClass)
+
+	if *actorsPerUser < 1 {
+		slog.Error("fatal: --actors-per-user must be >= 1",
+			slog.Int("actors_per_user", *actorsPerUser))
+		os.Exit(1)
+	}
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -116,11 +123,12 @@ func main() {
 	}
 
 	cfg := &userclass.Config{
-		APIStub:    apiStub,
-		HTTPClient: httpClient,
-		RouterURL:  *routerURL,
-		Atespace:   *atespace,
-		Dyn:        dyn,
+		APIStub:       apiStub,
+		HTTPClient:    httpClient,
+		RouterURL:     *routerURL,
+		Atespace:      *atespace,
+		Dyn:           dyn,
+		ActorsPerUser: *actorsPerUser,
 	}
 
 	entry, ok := userclass.Lookup(class)
