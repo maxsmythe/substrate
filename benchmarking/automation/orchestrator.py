@@ -362,9 +362,9 @@ def stop_gcs_prewarm(
     proc: subprocess.Popen | None, start_time: float, min_seconds: int
 ) -> None:
     """Sleep the remainder of min_seconds since start_time (so the prewarm
-    gets at least that long to ramp), then SIGTERM the process group. SIGTERM
-    lets the tool's cleanup phase run (deletes the warm-up objects it wrote)
-    instead of leaking them."""
+    gets at least that long to ramp), then SIGKILL the process group. We
+    don't need the tool's cleanup phase for these runs, so skipping SIGTERM
+    avoids waiting on the 15m delete budget."""
     if proc is None:
         return
     if proc.poll() is not None:
@@ -380,24 +380,12 @@ def stop_gcs_prewarm(
             flush=True,
         )
         time.sleep(wait)
-    print("Signalling gcs-prewarm to stop", flush=True)
+    print("SIGKILLing gcs-prewarm", flush=True)
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except ProcessLookupError:
         pass
-    # 20m covers the tool's 15m cleanup budget plus slack.
-    try:
-        proc.wait(timeout=20 * 60)
-    except subprocess.TimeoutExpired:
-        print(
-            "gcs-prewarm did not exit within 20m after SIGTERM; killing",
-            flush=True,
-        )
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
+    proc.wait()
 
 
 def deploy_workloads(
