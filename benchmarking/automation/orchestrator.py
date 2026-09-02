@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -327,6 +328,78 @@ def teardown_microvm_deps() -> None:
     run_no_check(["hack/install-microvm-deps.sh", "--delete"])
 
 
+def start_gcs_prewarm(
+    bucket: str, prefix: str
+) -> tuple[subprocess.Popen | None, float]:
+    """Ramp GCS write load in the background so the snapshot bucket's key
+    ranges scale up before the test's real snapshot traffic (a bucket sheds
+    write bursts with 429s until its autoscaler splits the loaded key
+    ranges). Returns (process, wall-clock start time), or (None, 0.0) when
+    BUCKET_NAME is unset."""
+    if not bucket:
+        print("BUCKET_NAME unset; skipping gcs-prewarm", flush=True)
+        return None, 0.0
+    cmd = [
+        "go",
+        "run",
+        "./tools/gcs-prewarm",
+        f"--bucket={bucket}",
+        f"--prefix={prefix}",
+        "--start-rate=50",
+        "--target-rate=800",
+        "--double-every=5m",
+        # Long hold; stop_gcs_prewarm signals it once workers are installed.
+        "--hold=60m",
+    ]
+    print(f"Starting gcs-prewarm in background: {' '.join(cmd)}", flush=True)
+    # New session so we can killpg() the whole `go run` + compiled-binary
+    # tree with one SIGTERM.
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    return proc, time.time()
+
+
+def stop_gcs_prewarm(
+    proc: subprocess.Popen | None, start_time: float, min_seconds: int
+) -> None:
+    """Sleep the remainder of min_seconds since start_time (so the prewarm
+    gets at least that long to ramp), then SIGTERM the process group. SIGTERM
+    lets the tool's cleanup phase run (deletes the warm-up objects it wrote)
+    instead of leaking them."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        print(
+            f"gcs-prewarm already exited with code {proc.returncode}", flush=True
+        )
+        return
+    elapsed = time.time() - start_time
+    if elapsed < min_seconds:
+        wait = min_seconds - elapsed
+        print(
+            f"gcs-prewarm has run {elapsed:.0f}s; waiting {wait:.0f}s to reach {min_seconds}s",
+            flush=True,
+        )
+        time.sleep(wait)
+    print("Signalling gcs-prewarm to stop", flush=True)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    # 20m covers the tool's 15m cleanup budget plus slack.
+    try:
+        proc.wait(timeout=20 * 60)
+    except subprocess.TimeoutExpired:
+        print(
+            "gcs-prewarm did not exit within 20m after SIGTERM; killing",
+            flush=True,
+        )
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
 def deploy_workloads(
     worker_count: int = 1,
     sandbox_class: str = "gvisor",
@@ -512,6 +585,15 @@ def main() -> None:
             status = "error"
             failure_msg = None
             start_time = time.time()
+            # Start the GCS bucket prewarm in the background so its ramp
+            # overlaps substrate + workload setup. stop_gcs_prewarm waits
+            # (below) until it has run for at least 25 minutes before
+            # signalling it, so the loaded key ranges are already split by
+            # the time run_test kicks off snapshot traffic.
+            prewarm_proc, prewarm_start = start_gcs_prewarm(
+                os.environ.get("BUCKET_NAME", ""),
+                "benchmark-workloads/glutton",
+            )
             try:
                 deploy_substrate(test.get("ateArgs", []))
                 TYPES[ttype].pre_test(test)
@@ -525,6 +607,10 @@ def main() -> None:
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
                 )
+                # Workers are up; hold here until the prewarm has had its
+                # full ramp before we invoke the runner.
+                stop_gcs_prewarm(prewarm_proc, prewarm_start, min_seconds=25 * 60)
+                prewarm_proc = None
                 try:
                     status = run_test(
                         test,
@@ -542,6 +628,9 @@ def main() -> None:
                 print(f"Test {test['name']} setup failed: {e}", flush=True)
                 failure_msg = str(e)
             finally:
+                # Stop the prewarm without further waiting if setup crashed
+                # before the in-band stop above ran.
+                stop_gcs_prewarm(prewarm_proc, prewarm_start, min_seconds=0)
                 # Always tear down, even if deploy or run failed, so the
                 # next test (and the next CronJob fire) starts clean.
                 # microvm-deps must go before substrate for the same reason
