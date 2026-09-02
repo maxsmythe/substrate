@@ -57,6 +57,7 @@ type Config struct {
 	MemTarget        string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
 	MemChurn         string // RAM re-randomized in place each cycle via WriteRAM rotate, suffixed (e.g. "64Mi"); "" disables
 	MemRead          string // RAM walked (one byte per page) via ReadRAM after each resume, suffixed (e.g. "1Gi") or "all"; "" disables
+	MaxPingsPerWake  int    // cap on pings a GluttonUser sends during one resume/suspend cycle; values < 1 read as 1
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -97,6 +98,7 @@ type payload struct {
 	MemTarget        *string  `json:"mem_target"`
 	MemChurn         *string  `json:"mem_churn"`
 	MemRead          *string  `json:"mem_read"`
+	MaxPingsPerWake  *float64 `json:"max_pings_per_wake"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -169,6 +171,9 @@ func (c Config) Validate() error {
 	if c.DurDirReadMode != "" && c.DurDirReadMode != ReadModeData && c.DurDirReadMode != ReadModeDigest {
 		return fmt.Errorf("invalid durdir_read_mode %q: must be %q or %q", c.DurDirReadMode, ReadModeData, ReadModeDigest)
 	}
+	// MaxPingsPerWake < 1 is treated as 1 at read time (see iterate() in
+	// glutton/lifecycle.go), so Config's zero value stays usable — no
+	// validate rejection here.
 	// MemTarget, MemChurn, and MemRead are passed to glutton verbatim
 	// (MemRead's "all" excepted, which the driver maps to an empty
 	// whole-array walk), which owns the parse; invalid values fail loudly
@@ -210,6 +215,9 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.MemRead != nil {
 		out.MemRead = *p.MemRead
+	}
+	if p.MaxPingsPerWake != nil {
+		out.MaxPingsPerWake = int(*p.MaxPingsPerWake)
 	}
 	return out
 }
@@ -279,6 +287,7 @@ func StartPoll(
 					slog.String("mem_target", next.MemTarget),
 					slog.String("mem_churn", next.MemChurn),
 					slog.String("mem_read", next.MemRead),
+					slog.Int("max_pings_per_wake", next.MaxPingsPerWake),
 				)
 			}
 		}
@@ -315,6 +324,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.String("mem_target", next.MemTarget),
 			slog.String("mem_churn", next.MemChurn),
 			slog.String("mem_read", next.MemRead),
+			slog.Int("max_pings_per_wake", next.MaxPingsPerWake),
 		)
 	})
 }

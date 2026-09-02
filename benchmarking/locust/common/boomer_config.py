@@ -20,6 +20,7 @@ Flag registration lives in the modules that own each flag:
   * --resume-mode                   → common.resume_mode.add_resume_mode_arguments
   * --durdir-*                      → common.durdir_config.add_durdir_arguments
   * --mem-target / --mem-churn / --mem-read → common.memload_config.add_memload_arguments
+  * --max-pings-per-wake            → common.ping_config.add_ping_arguments
 
 This module ties them together so boomer-Go workers can pick up the values
 the operator set in the web UI form:
@@ -56,6 +57,7 @@ _FLAGS = {
     "--mem-target": str,
     "--mem-churn": str,
     "--mem-read": str,
+    "--max-pings-per-wake": int,
 }
 
 
@@ -133,6 +135,7 @@ def init_boomer_config() -> None:
 
     from common.durdir_config import add_durdir_arguments
     from common.memload_config import add_memload_arguments
+    from common.ping_config import add_ping_arguments
     from common.resume_mode import add_resume_mode_arguments
     from common.trace import init_tracing
     from common.wait_time import init_wait_time

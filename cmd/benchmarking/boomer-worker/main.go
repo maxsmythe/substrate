@@ -65,7 +65,10 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	initialCfg, err := dynconfig.Parse([]byte(*configJSON), dynconfig.Config{MaxWait: 500 * time.Millisecond})
+	initialCfg, err := dynconfig.Parse([]byte(*configJSON), dynconfig.Config{
+		MaxWait:         500 * time.Millisecond,
+		MaxPingsPerWake: 2,
+	})
 	if err != nil {
 		slog.Error("failed to parse --config-json", slog.String("err", err.Error()))
 		os.Exit(1)

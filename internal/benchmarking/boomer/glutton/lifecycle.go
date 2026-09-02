@@ -56,6 +56,22 @@ const (
 	readRAMPath      = "/readram"
 	memLoadKey       = "memload"
 	memReadAll       = "all"
+
+	// ateapi returns Aborted with this message when two callers race an
+	// actor update (see cmd/ateapi/internal/controlapi/workflow_resume.go).
+	// It's transient — the loser retries and one of them wins.
+	concurrentUpdateMsg = "concurrent update conflict, please retry"
+	// Retry budget for ResumeActor concurrent-update conflicts. First retry
+	// is immediate (no initial backoff — conflicts often clear the instant
+	// the racing writer commits); subsequent gaps are pinned at 50ms.
+	resumeMaxAttempts = 5
+	resumeMaxBackoff  = 50 * time.Millisecond
+
+	// Per-wake ping loop: pings after the first are spaced by a random gap
+	// in [minPingGap, maxPingGap). The loop stops early once the wake
+	// window (dynamicWait) elapses so we still suspend on schedule.
+	minPingGap = 200 * time.Millisecond
+	maxPingGap = 1 * time.Second
 )
 
 func init() {
@@ -145,9 +161,26 @@ func (r *taskRuntime) iterate() {
 	// Rotate mode advances through the array cycle over cycle, so the dirty
 	// window moves instead of re-dirtying the same prefix.
 	actor.churnRAM(ctx)
+	// Pings during the wake window. The first ping runs immediately, then
+	// up to maxPings-1 more, each preceded by a random gap in
+	// [minPingGap, maxPingGap). The loop stops when either the ping cap or
+	// the wake-window deadline is reached; any leftover time is slept below
+	// so the actor stays live for the full window.
+	waitStart := time.Now()
+	deadline := waitStart.Add(r.dynamicWait())
+	maxPings := max(r.cfg.Dyn.Load().MaxPingsPerWake, 1)
 	actor.ping(ctx)
-
-	time.Sleep(r.dynamicWait())
+	for sent := 1; sent < maxPings; sent++ {
+		gap := minPingGap + time.Duration(rand.Float64()*float64(maxPingGap-minPingGap))
+		if time.Now().Add(gap).After(deadline) {
+			break
+		}
+		time.Sleep(gap)
+		actor.ping(ctx)
+	}
+	if remaining := time.Until(deadline); remaining > 0 {
+		time.Sleep(remaining)
+	}
 	needIdleSleep = false
 	actor.suspend(ctx)
 }
@@ -159,6 +192,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonActor, error) {
 	}
 	u := &gluttonActor{cfg: r.cfg, actors: make([]*gluttonActor, 0, n)}
 	bmetrics.UpdateUsers(userClass, 1)
+	var lastCreateErr error
 	for i := 0; i < n; i++ {
 		a := &gluttonActor{
 			cfg:         r.cfg,
@@ -176,15 +210,19 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonActor, error) {
 			}
 		}
 		if err := a.create(ctx); err != nil {
-			// Best-effort clean up the actors that did land so a partial
-			// startup doesn't leak them until shutdown.
-			for _, prev := range u.actors {
-				prev.delete(ctx)
-			}
-			bmetrics.UpdateUsers(userClass, -1)
-			return nil, err
+			lastCreateErr = err
+			slog.Warn("glutton create failed partway; using actors created so far",
+				slog.String("atespace", u.cfg.Atespace),
+				slog.Int("wanted", n),
+				slog.Int("got", len(u.actors)),
+				slog.String("err", err.Error()))
+			break
 		}
 		u.actors = append(u.actors, a)
+	}
+	if len(u.actors) == 0 {
+		bmetrics.UpdateUsers(userClass, -1)
+		return nil, fmt.Errorf("no actors created: %w", lastCreateErr)
 	}
 	return u, nil
 }
@@ -292,11 +330,34 @@ func (u *gluttonActor) resume(ctx context.Context) bool {
 		metricName = "ResumeActorColdStart"
 	}
 	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
-			Actor: u.ref(),
-			Boot:  u.firstResume,
-		}, grpc.Trailer(tr))
-		return err
+		// Retry Aborted "concurrent update conflict" transparently — it's a
+		// race, not a real failure, and the caller is expected to retry per
+		// the ateapi contract. Kept inside the tracedCall closure so metrics
+		// see the wall-clock time and the last attempt's server trailer,
+		// same as any other single-shot RPC.
+		var backoff time.Duration // 0 → first retry runs immediately
+		var lastErr error
+		for range resumeMaxAttempts {
+			_, lastErr = u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
+				Actor: u.ref(),
+				Boot:  u.firstResume,
+			}, grpc.Trailer(tr))
+			if lastErr == nil {
+				return nil
+			}
+			if !isConcurrentUpdateConflict(lastErr) {
+				return lastErr
+			}
+			if backoff > 0 {
+				select {
+				case <-time.After(backoff):
+				case <-callCtx.Done():
+					return callCtx.Err()
+				}
+			}
+			backoff = resumeMaxBackoff
+		}
+		return lastErr
 	})
 	if err != nil {
 		// ateapi reports a crashed actor as codes.Aborted with "crashed" in
@@ -315,6 +376,15 @@ func (u *gluttonActor) resume(ctx context.Context) bool {
 	u.firstResume = false
 	u.actorRunning = true
 	return true
+}
+
+// isConcurrentUpdateConflict identifies the transient racy-update error
+// ateapi's workflow_*.go returns as codes.Aborted with the retry-me message.
+// Kept distinct from the "crashed" Aborted check in resume() because the two
+// look the same at the code level and mean opposite things.
+func isConcurrentUpdateConflict(err error) bool {
+	s, ok := status.FromError(err)
+	return ok && s.Code() == codes.Aborted && strings.Contains(s.Message(), concurrentUpdateMsg)
 }
 
 func (u *gluttonActor) suspend(ctx context.Context) {
