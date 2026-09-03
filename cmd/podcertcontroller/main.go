@@ -103,6 +103,16 @@ func main() {
 		return
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.InfoContext(ctx, "podcertcontroller starting",
+		slog.String("version", version.String()),
+		slog.Bool("in_cluster", *inCluster),
+		slog.String("sharding_namespace", *shardingNamespace),
+		slog.String("sharding_pod_name", *shardingPodName),
+		slog.String("sharding_application_name", *shardingApplicationName),
+		slog.Int("workers_per_signer", *workersPerSigner),
+		slog.Any("kube_api_qps", *kubeAPIQPS),
+		slog.Int("kube_api_burst", *kubeAPIBurst),
+	)
 
 	var kconfig *rest.Config
 	var err error

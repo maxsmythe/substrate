@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/cachesync"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/rendezvous"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -104,7 +105,7 @@ func New(clock clock.PassiveClock, handler SignerImpl, kc kubernetes.Interface, 
 func (c *Controller) Run(ctx context.Context, workers int) {
 	defer c.pcrQueue.ShutDown()
 	go c.pcrInformer.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), c.pcrInformer.HasSynced) {
+	if !cachesync.Wait(ctx, "PodCertificateRequest/"+c.handler.SignerName(), c.pcrInformer.HasSynced) {
 		return
 	}
 

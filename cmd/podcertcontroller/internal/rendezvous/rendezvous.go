@@ -25,8 +25,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sync"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/cachesync"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,6 +103,10 @@ type Hasher struct {
 	leaseInformer cache.SharedIndexInformer
 
 	clock clock.Clock
+
+	// Rate limit for logUnassigned; see unassignedLogInterval.
+	logMu             sync.Mutex
+	lastUnassignedLog time.Time
 }
 
 // New returns a new Hasher.
@@ -135,7 +141,7 @@ func New(kc kubernetes.Interface, namespace, applicationName, replicaName string
 // Run starts the Hasher, blocking the current goroutine until ctx is done.
 func (h *Hasher) Run(ctx context.Context) {
 	go h.leaseInformer.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), h.leaseInformer.HasSynced) {
+	if !cachesync.Wait(ctx, "Lease/"+h.applicationName, h.leaseInformer.HasSynced) {
 		return
 	}
 	go wait.UntilWithContext(ctx, h.runOnce, leaseRenewalPeriod)
@@ -228,25 +234,68 @@ func (h *Hasher) AssignedToThisReplica(ctx context.Context, item string) bool {
 
 	liveReplicas := make([]string, 0, len(leases))
 	for _, lease := range leases {
+		if lease.Spec.HolderIdentity == nil || lease.Spec.RenewTime == nil {
+			continue
+		}
 		var leaseDuration time.Duration
 		if lease.Spec.LeaseDurationSeconds != nil {
 			leaseDuration = time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second
 		}
+		renewed := lease.Spec.RenewTime.Time
 
 		// If the replica hasn't checked in by the deadline, consider it dead.
-		deadline := lease.Spec.RenewTime.Time.Add(leaseDuration)
-		if now.After(deadline) {
-			continue
-		}
-
-		if lease.Spec.HolderIdentity == nil {
+		if now.After(renewed.Add(leaseDuration)) {
 			continue
 		}
 
 		liveReplicas = append(liveReplicas, *lease.Spec.HolderIdentity)
 	}
 
-	return Hash(item, liveReplicas) == h.replicaName
+	assigned := Hash(item, liveReplicas) == h.replicaName
+	if !assigned {
+		h.logUnassigned(ctx, item, leases, now)
+	}
+	return assigned
+}
+
+// unassignedLogInterval bounds how often logUnassigned writes. Every PCR that
+// hashes to a peer passes through here, so per-call logging would flood a
+// large rollout.
+const unassignedLogInterval = 30 * time.Second
+
+// logUnassigned records why this replica is standing aside for item: the
+// lease set it based the decision on, with each lease's holder and renewal
+// age relative to our clock. Without it a stale or clock-skewed peer lease
+// silently starves this replica of work with nothing in the logs.
+func (h *Hasher) logUnassigned(ctx context.Context, item string, leases []*coordinationv1.Lease, now time.Time) {
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	if now.Sub(h.lastUnassignedLog) < unassignedLogInterval {
+		return
+	}
+	h.lastUnassignedLog = now
+
+	attrs := []any{
+		slog.String("item", item),
+		slog.String("self", h.replicaName),
+		slog.Time("now", now),
+	}
+	for _, lease := range leases {
+		holder := "<nil>"
+		if lease.Spec.HolderIdentity != nil {
+			holder = *lease.Spec.HolderIdentity
+		}
+		var renewed time.Time
+		if lease.Spec.RenewTime != nil {
+			renewed = lease.Spec.RenewTime.Time
+		}
+		attrs = append(attrs, slog.Group(lease.Name,
+			slog.String("holder", holder),
+			slog.Time("renew_time", renewed),
+			slog.Duration("age", now.Sub(renewed)),
+		))
+	}
+	slog.InfoContext(ctx, "work item not assigned to this replica", attrs...)
 }
 
 func Hash(item string, replicas []string) string {
