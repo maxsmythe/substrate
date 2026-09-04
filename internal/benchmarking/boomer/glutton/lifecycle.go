@@ -332,9 +332,9 @@ func (u *gluttonActor) resume(ctx context.Context) bool {
 	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		// Retry Aborted "concurrent update conflict" transparently — it's a
 		// race, not a real failure, and the caller is expected to retry per
-		// the ateapi contract. Kept inside the tracedCall closure so metrics
-		// see the wall-clock time and the last attempt's server trailer,
-		// same as any other single-shot RPC.
+		// the ateapi contract. Kept inside the tracedCall closure so the
+		// reported latency spans every attempt and the span carries the
+		// last attempt's server trailer, same as any other single-shot RPC.
 		var backoff time.Duration // 0 → first retry runs immediately
 		var lastErr error
 		for range resumeMaxAttempts {
@@ -407,9 +407,10 @@ func (u *gluttonActor) delete(ctx context.Context) {
 }
 
 // tracedCall wraps a unary gRPC call with a span and Prometheus/locust
-// reporting. The reported latency comes from the server-side trailer
-// emitted by ateinterceptors.ServerUnaryInterceptor when present, falling
-// back to client-measured wall clock otherwise.
+// reporting. The reported latency is client wall clock, so it covers
+// retries inside do, queueing, and the network. The server-side elapsed
+// time from ateinterceptors.ServerUnaryInterceptor's trailer, when present,
+// goes on the span only: it measures the last attempt alone.
 func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(context.Context, *metadata.MD) error) error {
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
 	defer span.End()
@@ -417,13 +418,12 @@ func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(cont
 	start := time.Now()
 	var tr metadata.MD
 	err := do(ctx, &tr)
-	clientLatency := time.Since(start)
+	latency := time.Since(start)
 
-	latency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, clientLatency)
-	if source == boomerutil.SourceServer {
-		span.SetAttributes(attribute.Float64("server.elapsed_ms", boomerutil.MsFloat(latency)))
+	if serverLatency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, 0); source == boomerutil.SourceServer {
+		span.SetAttributes(attribute.Float64("server.elapsed_ms", boomerutil.MsFloat(serverLatency)))
 	}
-	boomerutil.LogSampledTrace(span, name, latency, source, err)
+	boomerutil.LogSampledTrace(span, name, latency, boomerutil.SourceClient, err)
 	if err != nil {
 		bmetrics.RecordFailure("grpc", name, userClass, latency, err.Error())
 		return err
