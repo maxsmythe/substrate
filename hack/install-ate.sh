@@ -931,7 +931,6 @@ create_api_authentication_config() {
       jwt_issuer="https://kubernetes.default.svc"
     fi
   fi
-
   local discovery_config=""
   case "${jwt_issuer}" in
     https://kubernetes.default.svc|https://kubernetes.default.svc.cluster.local)
@@ -940,6 +939,8 @@ create_api_authentication_config() {
   esac
   local authentication_config
   authentication_config=$(printf 'actorIdentityJWTProvider: kubernetes\njwtProviders:\n- name: kubernetes\n  issuer: %s\n  audiences: [api.ate-system.svc]\n%s' "${jwt_issuer}" "${discovery_config}")
+  echo "ate-api-authentication authentication.yaml:"
+  sed 's/^/  | /' <<<"${authentication_config}"
   run_kubectl create configmap -n ate-system ate-api-authentication \
     --from-literal=authentication.yaml="${authentication_config}" \
     --dry-run=client -o yaml \
