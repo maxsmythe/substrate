@@ -72,6 +72,12 @@ const (
 	// window (dynamicWait) elapses so we still suspend on schedule.
 	minPingGap = 200 * time.Millisecond
 	maxPingGap = 1 * time.Second
+
+	// After a suspend, the VU sleeps a random duration in
+	// [minPostSuspendSleep, maxPostSuspendSleep) before it resumes its
+	// next actor.
+	minPostSuspendSleep = 200 * time.Millisecond
+	maxPostSuspendSleep = 1 * time.Second
 )
 
 func init() {
@@ -183,6 +189,10 @@ func (r *taskRuntime) iterate() {
 	}
 	needIdleSleep = false
 	actor.suspend(ctx)
+	// Pause before the VU moves on to its next actor, so wakes are not
+	// scheduled back-to-back at the suspend rate and the random offset
+	// spreads VUs that started in the same spawn tick.
+	time.Sleep(minPostSuspendSleep + time.Duration(rand.Float64()*float64(maxPostSuspendSleep-minPostSuspendSleep)))
 }
 
 func (r *taskRuntime) startUser(ctx context.Context) (*gluttonActor, error) {
