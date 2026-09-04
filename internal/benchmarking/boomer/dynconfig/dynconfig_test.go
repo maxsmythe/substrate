@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/myzhan/boomer"
 )
 
 func TestParseValid(t *testing.T) {
@@ -228,6 +230,61 @@ func TestStartPollStopsWithTheContext(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := hits.Load(); got != stopped {
 		t.Errorf("poll continued after the context stopped: %d -> %d", stopped, got)
+	}
+}
+
+// A spawn fetch that fails after an earlier one succeeded reports
+// fetched=true and leaves the last applied value in place, so the caller can
+// keep the run going. A failure before any success reports fetched=false.
+func TestSubscribeSpawnReportsPriorSuccess(t *testing.T) {
+	var fail atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"trace_probability": 0.25}`))
+	}))
+	defer ts.Close()
+
+	type call struct {
+		err     error
+		fetched bool
+	}
+	var calls []call
+	holder := NewHolder(Config{})
+	// boomer.Events is a process-wide bus and SubscribeSpawn owns the handler
+	// value, so the subscription outlives this test. No other test publishes
+	// boomer:spawn, and each test uses its own holder, so that is harmless.
+	if err := SubscribeSpawn(ts.URL, holder, &fakeSampler{}, time.Second, func(err error, fetched bool) {
+		calls = append(calls, call{err: err, fetched: fetched})
+	}); err != nil {
+		t.Fatalf("SubscribeSpawn: %v", err)
+	}
+
+	fail.Store(true)
+	boomer.Events.Publish("boomer:spawn", 1, 1.0)
+	if len(calls) != 1 || calls[0].fetched {
+		t.Fatalf("after a failure with no prior success: calls = %+v, want one with fetched=false", calls)
+	}
+
+	fail.Store(false)
+	boomer.Events.Publish("boomer:spawn", 2, 1.0)
+	if len(calls) != 1 {
+		t.Fatalf("a successful fetch invoked onError: %+v", calls)
+	}
+	if got := holder.Load().TraceProbability; got != 0.25 {
+		t.Fatalf("holder trace_probability = %v, want 0.25", got)
+	}
+
+	fail.Store(true)
+	boomer.Events.Publish("boomer:spawn", 3, 1.0)
+	if len(calls) != 2 || !calls[1].fetched {
+		t.Fatalf("after a failure with a prior success: calls = %+v, want a second with fetched=true", calls)
+	}
+	if got := holder.Load().TraceProbability; got != 0.25 {
+		t.Fatalf("failed fetch changed holder trace_probability to %v", got)
 	}
 }
 
