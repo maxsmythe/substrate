@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,16 +27,21 @@ import (
 	"os/exec"
 	"slices"
 	"syscall"
+	"time"
 
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ocispec"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/internal/sizing"
 )
 
 type runsc struct {
 	path     string
 	actorUID string
+	// atespace is the actor's atespace. Only restoreFault reads it, to keep the
+	// hardcoded restore fault away from golden snapshot actors.
+	atespace string
 	// size is the actor's declared limits.
 	size sizing.SandboxSize
 	// durableVolumes are the durable-dir volume names declared to the sandbox.
@@ -266,7 +272,56 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		return fmt.Errorf("while shaping the OCI spec for %q: %w", containerName, err)
 	}
 
-	restoreArgs := []string{
+	if r.restoreFault() {
+		return r.fakeRestoreFailure(ctx, out, containerName)
+	}
+
+	cmd := exec.CommandContext(ctx, r.path, r.restoreArgs(containerName, checkpointPath)...)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := reaper.RunCommand(cmd); err != nil {
+		return fmt.Errorf("while running `runsc restore`: %w", err)
+	}
+	return nil
+}
+
+// errRestoreFault reads like the error exec returns when runsc dies with its
+// fatal exit code, so the caller sees exactly what a real failure produces.
+var errRestoreFault = errors.New("exit status 128")
+
+// restoreFault reports whether cmdRestore fakes a runsc failure for this actor.
+//
+// HACK TEMPORARY: to reproduce runsc restore exiting 128 on demand, every actor
+// outside the golden atespace fails to restore. Golden snapshot actors are
+// exempt so template creation still works.
+func (r *runsc) restoreFault() bool {
+	return r.atespace != resources.GoldenActorAtespace
+}
+
+// fakeRestoreFailure stands in for a runsc restore that exited 128: it writes
+// the error line runsc would have logged to out and returns the error
+// cmdRestore would have wrapped, without running runsc at all.
+func (r *runsc) fakeRestoreFailure(ctx context.Context, out io.Writer, containerName string) error {
+	slog.WarnContext(ctx, "Faking runsc restore failure", slog.String("container", containerName))
+	line, err := json.Marshal(map[string]string{
+		"level": "ERROR",
+		"time":  time.Now().UTC().Format(time.RFC3339Nano),
+		"msg":   fmt.Sprintf("starting container: restore failed: injected fault for container %q", containerName),
+	})
+	if err != nil {
+		return fmt.Errorf("while encoding fake restore failure: %w", err)
+	}
+	if _, err := fmt.Fprintf(out, "%s\n", line); err != nil {
+		return fmt.Errorf("while writing fake restore failure: %w", err)
+	}
+	return fmt.Errorf("while running `runsc restore`: %w", errRestoreFault)
+}
+
+// restoreArgs builds the argv for `runsc restore <container>` from the given
+// checkpoint image. Factored out so the argument construction can be
+// unit-tested without executing runsc.
+func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
+	return []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -277,8 +332,6 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		"-root", ateompath.RunSCStateDir(r.actorUID),
 		// Match cmdCreate: size the restored sentry from the cgroup CPU quota.
 		"--cpu-num-from-quota",
-	}
-	restoreArgs = append(restoreArgs,
 		"restore",
 		"-bundle", ateompath.OCIBundlePath(r.actorUID, containerName),
 		"-image-path", checkpointPath,
@@ -287,14 +340,7 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		"-direct",
 		"-detach",
 		containerName,
-	)
-	cmd := exec.CommandContext(ctx, r.path, restoreArgs...)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	if err := reaper.RunCommand(cmd); err != nil {
-		return fmt.Errorf("while running `runsc restore`: %w", err)
 	}
-	return nil
 }
 
 func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
