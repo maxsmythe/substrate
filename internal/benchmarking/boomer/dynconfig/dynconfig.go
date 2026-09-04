@@ -295,22 +295,25 @@ func StartPoll(
 }
 
 // SubscribeSpawn registers a boomer Events handler that fetches `url` on
-// each spawn message (≈ once per test start) and applies the result to
-// `holder` + `sampler`. `onError` is invoked when a fetch fails; production
-// callers typically exit the process there per the "treat as fatal" design.
+// each spawn message and applies the result to `holder` + `sampler`. Locust
+// sends a spawn message for every ramp step, so a long ramp fetches once per
+// second. `onError` is invoked when a fetch fails, with `fetched` true if an
+// earlier spawn fetch succeeded: the holder then still has a value from the
+// master, and the caller can keep running on it. With `fetched` false the
+// worker has only its command-line defaults, and callers typically exit.
 // Returns an error if the event subscription itself fails (handler signature
 // mismatch), which is a programmer error and should be treated as fatal too.
-func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetchTimeout time.Duration, onError func(error)) error {
+func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetchTimeout time.Duration, onError func(err error, fetched bool)) error {
+	var fetched atomic.Bool
 	return boomer.Events.Subscribe("boomer:spawn", func(spawnCount int, spawnRate float64) {
 		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 		defer cancel()
 		next, err := Fetch(ctx, url, holder.Load())
 		if err != nil {
-			slog.Error("dynconfig fetch failed",
-				slog.String("url", url), slog.String("err", err.Error()))
-			onError(err)
+			onError(err, fetched.Load())
 			return
 		}
+		fetched.Store(true)
 		holder.Store(next)
 		sampler.UpdateProbability(next.TraceProbability)
 		slog.Info("dynconfig applied",
