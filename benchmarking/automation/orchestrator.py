@@ -545,19 +545,18 @@ def main() -> None:
                 ate_args = _override_ate_arg(
                     ate_args, "--cordon-control-plane", "true"
                 )
-                # TODO TEMPORARY: 10k-scale runs need the size10 cluster
-                # profile; the size0 default max_connections=100 caps
-                # ate-api-server well below the load these tests generate.
-                # Remove once tests.yaml carries --cluster-size itself.
-                worker_count = test.get("workerCount", 1)
-                if "10k" in test["name"]:
-                    ate_args = _override_ate_arg(
-                        ate_args, "--cluster-size", "size10"
-                    )
-                    # TODO TEMPORARY: give 10k-scale runs 12000 workers so
-                    # the free pool never drains to zero at full load.
-                    # Remove once tests.yaml carries the value.
-                    worker_count = 12000
+                # TODO TEMPORARY: force the size10 cluster profile regardless
+                # of what tests.yaml supplied; the size0 default
+                # max_connections=100 caps ate-api-server well below the load
+                # these tests generate. Remove once tests.yaml carries
+                # --cluster-size itself.
+                ate_args = _override_ate_arg(
+                    ate_args, "--cluster-size", "size10"
+                )
+                # TODO TEMPORARY: force 12000 workers regardless of what
+                # tests.yaml supplied so the free pool never drains to zero at
+                # full load. Remove once tests.yaml carries the value.
+                worker_count = 12000
                 deploy_substrate(ate_args)
                 TYPES[ttype].pre_test(test)
                 # install-microvm-deps needs the CRDs from deploy_substrate;
