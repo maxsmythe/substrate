@@ -553,6 +553,14 @@ def main() -> None:
                 ate_args = _override_ate_arg(
                     ate_args, "--cluster-size", "size10"
                 )
+                # TODO TEMPORARY: give every control plane rollout 1200s
+                # regardless of what tests.yaml supplied; the size10
+                # postgres and the cordoned node pool take longer than the
+                # 60s default to come up. install-ate.sh takes a Go
+                # duration. Remove once tests.yaml carries the value.
+                ate_args = _override_ate_arg(
+                    ate_args, "--rollout-timeout", "1200s"
+                )
                 # TODO TEMPORARY: force 12000 workers regardless of what
                 # tests.yaml supplied so the free pool never drains to zero at
                 # full load. Remove once tests.yaml carries the value.
