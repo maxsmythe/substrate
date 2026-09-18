@@ -34,6 +34,11 @@ containers:
   - "--metrics-listen-addr=:9090"
   - "--data-dir=/tmp/glutton"
   - "--mode=http"
+  # HACK: every glutton actor burns 0.1 vCPU from startup (one worker at a
+  # 10% duty cycle) so the ping benchmarks run against an actor with a
+  # realistic idle CPU draw, without an extra RPC per actor.
+  - "--test-cpu-cores=1"
+  - "--test-cpu-duty-cycle=0.1"
   # Substrate puts no OTLP configuration in an actor container:
   # resolveActorEnv in cmd/atelet/oci.go merges the env of the ActorTemplate
   # and the ENV of the image, and nothing more. Without the value below, the

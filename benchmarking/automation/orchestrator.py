@@ -563,15 +563,6 @@ def main() -> None:
                 # deploy_workloads needs the microvm SandboxConfig.
                 if sandbox_class == "microvm":
                     install_microvm_deps()
-                # TODO TEMPORARY: force a one-hour worker wait regardless of
-                # what tests.yaml supplied; deploy.sh takes whole seconds.
-                # Remove once tests.yaml carries workerWaitTimeout itself.
-                deploy_workloads(
-                    worker_count,
-                    sandbox_class,
-                    test.get("actorMemory", ""),
-                    3600,
-                )
                 # TODO TEMPORARY: force the glutton timing knobs regardless of
                 # what tests.yaml supplied: a 0.2-1.0s wait between suspend
                 # and the next resume, a 9-14s live window per wake, and up
@@ -579,6 +570,7 @@ def main() -> None:
                 # --max-pings-per-wake, so leave the other tests alone.
                 # Remove once tests.yaml carries these flags itself.
                 test_spec = test
+                actor_memory = test.get("actorMemory", "")
                 if "glutton.py" in str(test.get("file", "")):
                     flags = list(test.get("flags", []))
                     for flag, value in (
@@ -589,7 +581,29 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
+                    # HACK: the ping suites run against a 512Mi resident
+                    # working set that rotates a 64Mi dirty window every
+                    # cycle, so each suspend snapshots a realistically sized,
+                    # changing actor rather than an empty one. Suites that
+                    # size their own working set (--mem-target) keep it, and
+                    # keep their own actorMemory. 1Gi leaves the same headroom
+                    # above the target as the glutton_mem_* suites.
+                    # (The 0.1 vCPU half of this lives in the glutton
+                    # ActorTemplate's startup flags.)
+                    if not any(f.startswith("--mem-target") for f in flags):
+                        flags = _override_ate_arg(flags, "--mem-target", "512Mi")
+                        flags = _override_ate_arg(flags, "--mem-churn", "64Mi")
+                        actor_memory = "1Gi"
                     test_spec = {**test, "flags": flags}
+                # TODO TEMPORARY: force a one-hour worker wait regardless of
+                # what tests.yaml supplied; deploy.sh takes whole seconds.
+                # Remove once tests.yaml carries workerWaitTimeout itself.
+                deploy_workloads(
+                    worker_count,
+                    sandbox_class,
+                    actor_memory,
+                    3600,
+                )
                 try:
                     status = run_test(
                         test_spec,
