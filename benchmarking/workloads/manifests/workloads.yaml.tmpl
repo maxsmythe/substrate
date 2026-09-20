@@ -35,3 +35,11 @@ spec:
   replicas: ${WORKER_COUNT}
   sandboxClass: ${SANDBOX_CLASS}
   workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-${SANDBOX_CLASS}
+  template:
+    # The actor sandbox runs inside the worker pod, so this request is what
+    # the scheduler counts per hosted actor. No limit: the actor's own
+    # resources.limits.memory bounds the sandbox, and a pod limit on top
+    # would only add a second OOM boundary. See deploy.sh --worker-memory-request.
+    resources:
+      requests:
+        memory: ${WORKER_MEMORY_REQUEST}

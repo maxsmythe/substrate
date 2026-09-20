@@ -581,19 +581,22 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
-                    # HACK: the ping suites run against a 512Mi resident
+                    # HACK: the ping suites run against a 256Mi resident
                     # working set that rotates a 64Mi dirty window every
                     # cycle, so each suspend snapshots a realistically sized,
                     # changing actor rather than an empty one. Suites that
                     # size their own working set (--mem-target) keep it, and
-                    # keep their own actorMemory. 1Gi leaves the same headroom
-                    # above the target as the glutton_mem_* suites.
+                    # keep their own actorMemory. 512Mi leaves the same
+                    # headroom above the target as the glutton_mem_* suites.
+                    # 256Mi is what a 1k-node c3-highcpu-4 fleet can hold at
+                    # 10k actors: the 512Mi working set this used to force
+                    # OOM-killed sandboxes and atelet on half the nodes.
                     # (The 0.1 vCPU half of this lives in the glutton
                     # ActorTemplate's startup flags.)
                     if not any(f.startswith("--mem-target") for f in flags):
-                        flags = _override_ate_arg(flags, "--mem-target", "512Mi")
+                        flags = _override_ate_arg(flags, "--mem-target", "256Mi")
                         flags = _override_ate_arg(flags, "--mem-churn", "64Mi")
-                        actor_memory = "1Gi"
+                        actor_memory = "512Mi"
                     test_spec = {**test, "flags": flags}
                 # TODO TEMPORARY: force a one-hour worker wait regardless of
                 # what tests.yaml supplied; deploy.sh takes whole seconds.

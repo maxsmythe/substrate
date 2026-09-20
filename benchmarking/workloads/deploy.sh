@@ -49,6 +49,14 @@ SANDBOX_CLASS="gvisor"
 # so benchmark actors do not inherit the 2 GiB kata default and drag its page
 # cache into every memory snapshot. Raise it for RAM-consuming suites.
 ACTOR_MEMORY="256Mi"
+# Memory request for each ateom worker pod (WorkerPool template
+# resources.requests.memory). The actor sandbox runs inside the worker pod, so
+# this is what the scheduler counts per hosted actor: a gVisor actor holding
+# the 256Mi default working set measures about 300Mi resident (the working
+# set, ~25Mi of sentry, ~15Mi of ateom, gofer, and runsc). Without a request
+# the scheduler packs workers by count alone and the node OOM killer, not the
+# scheduler, decides how many actors a node runs.
+WORKER_MEMORY_REQUEST="320Mi"
 # The address to which an instrumented actor container sends its telemetry.
 # --otlp-endpoint sets it. Without the flag, resolve_otlp_endpoint reads the
 # address that the control plane uses.
@@ -68,6 +76,10 @@ usage() {
   echo "                              microvm requires hack/install-microvm-deps.sh --install to have run."
   echo "  --actor-memory SIZE         Memory limit for the benchmark ActorTemplates (default: 256Mi,"
   echo "                              the smallest size microvm admits)"
+  echo "  --worker-memory-request SIZE"
+  echo "                              Memory request for each ateom worker pod, which hosts the actor"
+  echo "                              sandbox (default: 320Mi, about what one actor at the default"
+  echo "                              --actor-memory occupies). Raise it with --actor-memory."
   echo "  --otlp-endpoint URL         The address to which an instrumented actor container"
   echo "                              sends telemetry (default: the endpoint in the"
   echo "                              ate-otel-config ConfigMap)"
@@ -133,6 +145,7 @@ substitute() {
       -e "s|\${SANDBOX_CONFIG_NAME}|${sandbox_config_name}|g" \
       -e "s|\${OTLP_ENDPOINT}|${OTLP_ENDPOINT}|g" \
       -e "s|\${ACTOR_MEMORY}|${ACTOR_MEMORY}|g" \
+      -e "s|\${WORKER_MEMORY_REQUEST}|${WORKER_MEMORY_REQUEST}|g" \
       "${manifest}"
 }
 
@@ -269,6 +282,13 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --actor-memory=*)
       ACTOR_MEMORY="${1#*=}"
+      ;;
+    --worker-memory-request)
+      shift
+      WORKER_MEMORY_REQUEST="$1"
+      ;;
+    --worker-memory-request=*)
+      WORKER_MEMORY_REQUEST="${1#*=}"
       ;;
     --wait-timeout)
       shift
