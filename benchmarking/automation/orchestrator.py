@@ -664,12 +664,22 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
-                    # No forced resident working set: the ping suites run
-                    # against empty actors, as on main. Suites that size their
-                    # own working set (--mem-target) keep it and their own
-                    # actorMemory. A forced set of random bytes ships whole
-                    # with every full snapshot; at 10k actors even 128Mi kept
-                    # the snapshot bucket as the bottleneck.
+                    # HACK: the ping suites run against a 64Mi resident
+                    # working set that rotates a 16Mi dirty window every
+                    # cycle, so each suspend snapshots a changing actor rather
+                    # than an empty one. Suites that size their own working
+                    # set (--mem-target) keep it and their own actorMemory.
+                    # The set is random bytes, so every full snapshot ships
+                    # all of it: at 10k actors, 128Mi and above left the
+                    # snapshot bucket as the bottleneck, and empty actors ran
+                    # at baseline speed. 64Mi is the next step down.
+                    # actorMemory is left at its default (256Mi from
+                    # workloads/deploy.sh): glutton's heap can reach twice
+                    # the target during the fill, plus the Go runtime, so a
+                    # 2x limit would be too tight at this size.
+                    if not any(f.startswith("--mem-target") for f in flags):
+                        flags = _override_ate_arg(flags, "--mem-target", "64Mi")
+                        flags = _override_ate_arg(flags, "--mem-churn", "16Mi")
                     test_spec = {**test, "flags": flags}
                 # TODO TEMPORARY: force a one-hour worker wait regardless of
                 # what tests.yaml supplied; deploy.sh takes whole seconds.
