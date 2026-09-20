@@ -664,23 +664,12 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
-                    # HACK: the ping suites run against a 128Mi resident
-                    # working set that rotates a 64Mi dirty window every
-                    # cycle, so each suspend snapshots a realistically sized,
-                    # changing actor rather than an empty one. Suites that
-                    # size their own working set (--mem-target) keep it, and
-                    # keep their own actorMemory. 256Mi leaves the same
-                    # headroom above the target as the glutton_mem_* suites.
-                    # The working set is random bytes, so every full snapshot
-                    # ships all of it uncompressed: at 10k actors a 256Mi set
-                    # saturated the snapshot bucket and suspends took 12x the
-                    # baseline, and a 512Mi set OOM-killed half the fleet.
-                    # (The 0.1 vCPU half of this lives in the glutton
-                    # ActorTemplate's startup flags.)
-                    if not any(f.startswith("--mem-target") for f in flags):
-                        flags = _override_ate_arg(flags, "--mem-target", "128Mi")
-                        flags = _override_ate_arg(flags, "--mem-churn", "64Mi")
-                        actor_memory = "256Mi"
+                    # No forced resident working set: the ping suites run
+                    # against empty actors, as on main. Suites that size their
+                    # own working set (--mem-target) keep it and their own
+                    # actorMemory. A forced set of random bytes ships whole
+                    # with every full snapshot; at 10k actors even 128Mi kept
+                    # the snapshot bucket as the bottleneck.
                     test_spec = {**test, "flags": flags}
                 # TODO TEMPORARY: force a one-hour worker wait regardless of
                 # what tests.yaml supplied; deploy.sh takes whole seconds.
