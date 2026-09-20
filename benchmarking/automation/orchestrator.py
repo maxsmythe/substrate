@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -347,6 +348,80 @@ def teardown_microvm_deps() -> None:
     run_no_check(["hack/install-microvm-deps.sh", "--delete"])
 
 
+# The object prefix the glutton suites' snapshots are written under: the
+# glutton ActorTemplate's storageLocation (benchmark-workloads/glutton, see
+# workloads/manifests/glutton-template.yaml.tmpl) plus the actor prefix the
+# atelet derives from it, atespaces/<atespace>/actors/<uid>. The random actor
+# uid comes right after this prefix, which is what lets the prewarm's random
+# keys land in the same key range as the real traffic.
+GLUTTON_SNAPSHOT_PREFIX = "benchmark-workloads/glutton/atespaces/benchmark/actors"
+
+# How long the prewarm must have run before the test starts. GCS splits a
+# loaded key range on the order of every 20 minutes per doubling, so a
+# shorter ramp leaves the scaling window inside the measured run.
+GCS_PREWARM_MIN_SECONDS = 25 * 60
+
+
+def start_gcs_prewarm(
+    bucket: str, prefix: str
+) -> tuple[subprocess.Popen | None, float]:
+    """Ramp GCS write load in the background so the snapshot bucket's key
+    ranges scale up before the test's real snapshot traffic (a bucket sheds
+    write bursts with 429s until its autoscaler splits the loaded key
+    ranges). Returns (process, wall-clock start time), or (None, 0.0) when
+    BUCKET_NAME is unset."""
+    if not bucket:
+        print("BUCKET_NAME unset; skipping gcs-prewarm", flush=True)
+        return None, 0.0
+    cmd = [
+        "go",
+        "run",
+        "./tools/gcs-prewarm",
+        f"--bucket={bucket}",
+        f"--prefix={prefix}",
+        "--start-rate=50",
+        "--target-rate=800",
+        "--double-every=5m",
+        # Long hold; stop_gcs_prewarm signals it once workers are installed.
+        "--hold=60m",
+    ]
+    print(f"Starting gcs-prewarm in background: {' '.join(cmd)}", flush=True)
+    # New session so we can killpg() the whole `go run` + compiled-binary
+    # tree with one signal.
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    return proc, time.time()
+
+
+def stop_gcs_prewarm(
+    proc: subprocess.Popen | None, start_time: float, min_seconds: int
+) -> None:
+    """Sleep the remainder of min_seconds since start_time (so the prewarm
+    gets at least that long to ramp), then SIGKILL the process group. We
+    don't need the tool's cleanup phase for these runs, so skipping SIGTERM
+    avoids waiting on its delete budget."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        print(
+            f"gcs-prewarm already exited with code {proc.returncode}", flush=True
+        )
+        return
+    elapsed = time.time() - start_time
+    if elapsed < min_seconds:
+        wait = min_seconds - elapsed
+        print(
+            f"gcs-prewarm has run {elapsed:.0f}s; waiting {wait:.0f}s to reach {min_seconds}s",
+            flush=True,
+        )
+        time.sleep(wait)
+    print("SIGKILLing gcs-prewarm", flush=True)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
 def deploy_workloads(
     worker_count: int = 1,
     sandbox_class: str = "gvisor",
@@ -532,6 +607,14 @@ def main() -> None:
             status = "error"
             failure_msg = None
             start_time = time.time()
+            # Start the GCS bucket prewarm in the background so its ramp
+            # overlaps substrate + workload setup. stop_gcs_prewarm waits
+            # (below) until it has run for at least GCS_PREWARM_MIN_SECONDS
+            # before killing it, so the loaded key ranges are already split
+            # by the time run_test kicks off snapshot traffic.
+            prewarm_proc, prewarm_start = start_gcs_prewarm(
+                os.environ.get("BUCKET_NAME", ""), GLUTTON_SNAPSHOT_PREFIX
+            )
             try:
                 ate_args = list(test.get("ateArgs", []))
                 # TODO TEMPORARY: force more signer workers regardless of what
@@ -581,22 +664,23 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
-                    # HACK: the ping suites run against a 256Mi resident
+                    # HACK: the ping suites run against a 128Mi resident
                     # working set that rotates a 64Mi dirty window every
                     # cycle, so each suspend snapshots a realistically sized,
                     # changing actor rather than an empty one. Suites that
                     # size their own working set (--mem-target) keep it, and
-                    # keep their own actorMemory. 512Mi leaves the same
+                    # keep their own actorMemory. 256Mi leaves the same
                     # headroom above the target as the glutton_mem_* suites.
-                    # 256Mi is what a 1k-node c3-highcpu-4 fleet can hold at
-                    # 10k actors: the 512Mi working set this used to force
-                    # OOM-killed sandboxes and atelet on half the nodes.
+                    # The working set is random bytes, so every full snapshot
+                    # ships all of it uncompressed: at 10k actors a 256Mi set
+                    # saturated the snapshot bucket and suspends took 12x the
+                    # baseline, and a 512Mi set OOM-killed half the fleet.
                     # (The 0.1 vCPU half of this lives in the glutton
                     # ActorTemplate's startup flags.)
                     if not any(f.startswith("--mem-target") for f in flags):
-                        flags = _override_ate_arg(flags, "--mem-target", "256Mi")
+                        flags = _override_ate_arg(flags, "--mem-target", "128Mi")
                         flags = _override_ate_arg(flags, "--mem-churn", "64Mi")
-                        actor_memory = "512Mi"
+                        actor_memory = "256Mi"
                     test_spec = {**test, "flags": flags}
                 # TODO TEMPORARY: force a one-hour worker wait regardless of
                 # what tests.yaml supplied; deploy.sh takes whole seconds.
@@ -607,6 +691,12 @@ def main() -> None:
                     actor_memory,
                     3600,
                 )
+                # Workers are up; hold here until the prewarm has had its
+                # full ramp before we invoke the runner.
+                stop_gcs_prewarm(
+                    prewarm_proc, prewarm_start, GCS_PREWARM_MIN_SECONDS
+                )
+                prewarm_proc = None
                 try:
                     status = run_test(
                         test_spec,
@@ -624,6 +714,9 @@ def main() -> None:
                 print(f"Test {test['name']} setup failed: {e}", flush=True)
                 failure_msg = str(e)
             finally:
+                # Stop the prewarm without further waiting if setup crashed
+                # before the in-band stop above ran.
+                stop_gcs_prewarm(prewarm_proc, prewarm_start, min_seconds=0)
                 # Always tear down, even if deploy or run failed, so the
                 # next test (and the next CronJob fire) starts clean.
                 # microvm-deps must go before substrate for the same reason
