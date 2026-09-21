@@ -664,22 +664,16 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
-                    # HACK: the ping suites run against a 64Mi resident
-                    # working set that rotates a 16Mi dirty window every
-                    # cycle, so each suspend snapshots a changing actor rather
-                    # than an empty one. Suites that size their own working
-                    # set (--mem-target) keep it and their own actorMemory.
-                    # The set is random bytes, so every full snapshot ships
-                    # all of it: at 10k actors, 128Mi and above left the
-                    # snapshot bucket as the bottleneck, and empty actors ran
-                    # at baseline speed. 64Mi is the next step down.
-                    # actorMemory is left at its default (256Mi from
-                    # workloads/deploy.sh): glutton's heap can reach twice
-                    # the target during the fill, plus the Go runtime, so a
-                    # 2x limit would be too tight at this size.
-                    if not any(f.startswith("--mem-target") for f in flags):
-                        flags = _override_ate_arg(flags, "--mem-target", "64Mi")
-                        flags = _override_ate_arg(flags, "--mem-churn", "16Mi")
+                    # No forced resident working set: the ping suites run
+                    # against empty actors, as on main. Suites that size their
+                    # own working set (--mem-target) keep it and their own
+                    # actorMemory. A forced set of random bytes ships whole
+                    # with every full snapshot, and at 10k actors the restores
+                    # exceed the project's 200 Gbps Cloud Storage egress quota
+                    # (storage.googleapis.com/google_egress_bandwidth) for any
+                    # set above roughly 35Mi; even 64Mi tripled suspend and
+                    # resume latency. Raise that quota, or make the fill data
+                    # compressible, before turning a working set back on.
                     test_spec = {**test, "flags": flags}
                 # TODO TEMPORARY: force a one-hour worker wait regardless of
                 # what tests.yaml supplied; deploy.sh takes whole seconds.
