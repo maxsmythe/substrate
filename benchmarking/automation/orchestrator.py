@@ -664,6 +664,15 @@ def main() -> None:
                         ("--max-pings-per-wake", "2"),
                     ):
                         flags = _override_ate_arg(flags, flag, value)
+                    # HACK: every glutton actor burns 0.1 vCPU (one worker at
+                    # a 10% duty cycle) so the ping benchmarks run against an
+                    # actor with a realistic idle CPU draw. Suites that size
+                    # their own CPU load (--cpu-cores) keep it.
+                    if not any(f.startswith("--cpu-cores") for f in flags):
+                        flags = _override_ate_arg(flags, "--cpu-cores", "1")
+                        flags = _override_ate_arg(
+                            flags, "--cpu-duty-cycle", "0.1"
+                        )
                     # No forced resident working set: the ping suites run
                     # against empty actors, as on main. Suites that size their
                     # own working set (--mem-target) keep it and their own
