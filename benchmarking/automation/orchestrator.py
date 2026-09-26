@@ -65,6 +65,54 @@ NAMESPACE = "benchmarking"
 
 TEST_TYPES = tuple(TYPES)
 
+# The test suite to run, in the same shape tests.yaml used to supply.
+TESTS: list[dict[str, Any]] = [
+    {
+        "name": "attempt_1k_per_vcpu_density",
+        "type": "locust",
+        "description": "Glutton baseline: 10000 concurrent users for 20 minutes",
+        "targetCluster": "dev",
+        "file": "/app/tests/glutton.py",
+        "duration": "25m",
+        "users": 100,
+        "workerCount": 110,
+        "workerWaitTimeout": 360,
+        "ateArgs": [
+            "--podcert-workers-per-signer",
+            "10",
+            "--rollout-timeout",
+            "600s",
+            "--cordon-control-plane",
+        ],
+        "flags": [
+            "--actors-per-user",
+            "400",
+            "--min-wait-time",
+            "0.2",
+            "--max-wait-time",
+            "1.0",
+            "--min-live-time",
+            "0.5",
+            "--max-live-time",
+            "1",
+            "--cpu-cores",  # https://github.com/agent-substrate/substrate/pull/1875 must be merged for CPU to work
+            "1",
+            "--cpu-duty-cycle",
+            "0.1",
+            # "--mem-target",
+            # "512Mi",
+            # "--mem-churn",
+            # "64Mi",
+            "--max-pings-per-wake",
+            "2",
+            "--spawn-rate",
+            "30",
+            "--trace-probability",
+            "0.0002",
+        ],
+    },
+]
+
 # Snapshot the process's initial env so apply_config can return to a known
 # baseline before sourcing the next config (avoids stale vars carrying over
 # from a prior test if that test's config defined keys the next one doesn't).
@@ -83,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tests",
         default="/etc/orchestrator/tests.yaml",
-        help="Path to the tests YAML file (mounted from a ConfigMap)",
+        help="Ignored: the suite comes from the TESTS constant",
     )
     p.add_argument(
         "--target-cluster-dir",
@@ -304,26 +352,6 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"(want one of {list(TEST_TYPES)})"
             )
         TYPES[ttype].validate(t)
-
-
-def _override_ate_arg(ate_args: list[str], flag: str, value: str) -> list[str]:
-    """Drop every prior occurrence of ``flag`` (both ``--flag=x`` and
-    ``--flag x`` forms) from ``ate_args`` and append ``flag=value``, so
-    the override always wins over whatever tests.yaml supplied."""
-    out: list[str] = []
-    skip_next = False
-    for a in ate_args:
-        if skip_next:
-            skip_next = False
-            continue
-        if a == flag:
-            skip_next = True
-            continue
-        if a.startswith(flag + "="):
-            continue
-        out.append(a)
-    out.append(f"{flag}={value}")
-    return out
 
 
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
@@ -549,7 +577,7 @@ def main() -> None:
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(f"Building commit {commit}", flush=True)
 
-    tests = yaml.safe_load(Path(args.tests).read_text())["tests"]
+    tests = TESTS
     print(f"Running {len(tests)} test(s)", flush=True)
     try:
         validate_and_normalize_tests(tests)
@@ -616,82 +644,17 @@ def main() -> None:
                 os.environ.get("BUCKET_NAME", ""), GLUTTON_SNAPSHOT_PREFIX
             )
             try:
-                ate_args = list(test.get("ateArgs", []))
-                # TODO TEMPORARY: force more signer workers regardless of what
-                # tests.yaml supplied. Remove once tests.yaml carries the value.
-                ate_args = _override_ate_arg(
-                    ate_args, "--podcert-workers-per-signer", "30"
-                )
-                # TODO TEMPORARY: pin every control plane workload to its own
-                # node of the ate-control-plane pool regardless of what
-                # tests.yaml supplied. Remove once tests.yaml carries the flag.
-                ate_args = _override_ate_arg(
-                    ate_args, "--cordon-control-plane", "true"
-                )
-                # TODO TEMPORARY: force the size10 cluster profile regardless
-                # of what tests.yaml supplied; the size0 default
-                # max_connections=100 caps ate-api-server well below the load
-                # these tests generate. Remove once tests.yaml carries
-                # --cluster-size itself.
-                ate_args = _override_ate_arg(
-                    ate_args, "--cluster-size", "size10"
-                )
-                # TODO TEMPORARY: force 12000 workers regardless of what
-                # tests.yaml supplied so the free pool never drains to zero at
-                # full load. Remove once tests.yaml carries the value.
-                worker_count = 12000
-                deploy_substrate(ate_args)
+                deploy_substrate(test.get("ateArgs", []))
                 TYPES[ttype].pre_test(test)
                 # install-microvm-deps needs the CRDs from deploy_substrate;
                 # deploy_workloads needs the microvm SandboxConfig.
                 if sandbox_class == "microvm":
                     install_microvm_deps()
-                # TODO TEMPORARY: force the glutton timing knobs regardless of
-                # what tests.yaml supplied: a 0.2-1.0s wait between suspend
-                # and the next resume, a 9-14s live window per wake, and up
-                # to two pings per wake. Only glutton registers
-                # --max-pings-per-wake, so leave the other tests alone.
-                # Remove once tests.yaml carries these flags itself.
-                test_spec = test
-                actor_memory = test.get("actorMemory", "")
-                if "glutton.py" in str(test.get("file", "")):
-                    flags = list(test.get("flags", []))
-                    for flag, value in (
-                        ("--min-wait-time", "0.2"),
-                        ("--max-wait-time", "1.0"),
-                        ("--min-live-time", "9"),
-                        ("--max-live-time", "14"),
-                        ("--max-pings-per-wake", "2"),
-                    ):
-                        flags = _override_ate_arg(flags, flag, value)
-                    # HACK: every glutton actor burns 0.1 vCPU (one worker at
-                    # a 10% duty cycle) so the ping benchmarks run against an
-                    # actor with a realistic idle CPU draw. Suites that size
-                    # their own CPU load (--cpu-cores) keep it.
-                    if not any(f.startswith("--cpu-cores") for f in flags):
-                        flags = _override_ate_arg(flags, "--cpu-cores", "1")
-                        flags = _override_ate_arg(
-                            flags, "--cpu-duty-cycle", "0.1"
-                        )
-                    # No forced resident working set: the ping suites run
-                    # against empty actors, as on main. Suites that size their
-                    # own working set (--mem-target) keep it and their own
-                    # actorMemory. A forced set of random bytes ships whole
-                    # with every full snapshot, and at 10k actors the restores
-                    # exceed the project's 200 Gbps Cloud Storage egress quota
-                    # (storage.googleapis.com/google_egress_bandwidth) for any
-                    # set above roughly 35Mi; even 64Mi tripled suspend and
-                    # resume latency. Raise that quota, or make the fill data
-                    # compressible, before turning a working set back on.
-                    test_spec = {**test, "flags": flags}
-                # TODO TEMPORARY: force a one-hour worker wait regardless of
-                # what tests.yaml supplied; deploy.sh takes whole seconds.
-                # Remove once tests.yaml carries workerWaitTimeout itself.
                 deploy_workloads(
-                    worker_count,
+                    test.get("workerCount", 1),
                     sandbox_class,
-                    actor_memory,
-                    3600,
+                    test.get("actorMemory", ""),
+                    test.get("workerWaitTimeout", ""),
                 )
                 # Workers are up; hold here until the prewarm has had its
                 # full ramp before we invoke the runner.
@@ -701,7 +664,7 @@ def main() -> None:
                 prewarm_proc = None
                 try:
                     status = run_test(
-                        test_spec,
+                        test,
                         images[ttype],
                         args.dest,
                         commit,
