@@ -37,13 +37,16 @@ contract). The flow, with the type hooks marked:
 """
 
 import argparse
+import copy
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
@@ -63,6 +66,52 @@ MANIFESTS_DIR = "/opt/automation/manifests"
 NAMESPACE = "benchmarking"
 
 TEST_TYPES = tuple(TYPES)
+
+# HACK: forces these tests regardless of --tests.
+TESTS: list[dict[str, Any]] = [
+    {
+        "name": "ALPHA_glutton_200k_actor_nomem",
+        "type": "locust",
+        "description": "Glutton baseline: 10000 concurrent users for 20 minutes",
+        "targetCluster": "dev",
+        "file": "/app/tests/glutton.py",
+        "duration": "20m",
+        "users": 10000,
+        "workerCount": 11000,
+        "workerWaitTimeout": 3600,
+        "ateArgs": [
+            "--podcert-workers-per-signer",
+            "10",
+            "--rollout-timeout",
+            "600s",
+            "--cluster-size=size10",
+            "--cordon-control-plane",
+        ],
+        "flags": [
+            "--actors-per-user",
+            "20",
+            "--min-wait-time",
+            "0.2",
+            "--max-wait-time",
+            "1.0",
+            "--min-live-time",
+            "9.0",
+            "--max-live-time",
+            "14.0",
+            # https://github.com/agent-substrate/substrate/pull/1875 must be merged for CPU to work
+            # "--cpu-cores",
+            # "1",
+            # "--cpu-duty-cycle",
+            # "0.1",
+            "--max-pings-per-wake",
+            "2",
+            "--spawn-rate",
+            "30",
+            "--trace-probability",
+            "0.0002",
+        ],
+    },
+]
 
 # Snapshot the process's initial env so apply_config can return to a known
 # baseline before sourcing the next config (avoids stale vars carrying over
@@ -357,6 +406,97 @@ def teardown_workloads() -> None:
     run_no_check(["benchmarking/workloads/deploy.sh", "--delete"])
 
 
+TOP_INTERVAL_SECONDS = 15
+
+
+def start_top_sampler(out_path: str) -> subprocess.Popen:
+    """HACK: sample `kubectl top` for ate-system every TOP_INTERVAL_SECONDS
+    into out_path until terminated. Failures only land in the file."""
+    script = (
+        "while true; do "
+        "echo \"=== $(date -u +%Y-%m-%dT%H:%M:%SZ)\"; "
+        "kubectl top pod -n ate-system --containers 2>&1; "
+        f"sleep {TOP_INTERVAL_SECONDS}; "
+        "done"
+    )
+    out = open(out_path, "w")
+    return subprocess.Popen(
+        ["bash", "-c", script], stdout=out, stderr=subprocess.STDOUT
+    )
+
+
+def stop_top_sampler(proc: subprocess.Popen, out_path: str, dest: str) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    run_no_check(["gcloud", "storage", "cp", out_path, dest])
+
+
+PPROF_PORT = 6060
+PPROF_SECONDS = 30
+
+
+def capture_api_server_profile(pod: str, local_port: int, out_path: str) -> bool:
+    """Port-forward to pod's loopback pprof and save a CPU profile."""
+    pf = subprocess.Popen(
+        [
+            "kubectl", "port-forward", "-n", "ate-system", pod,
+            f"{local_port}:{PPROF_PORT}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    url = f"http://127.0.0.1:{local_port}/debug/pprof/profile?seconds={PPROF_SECONDS}"
+    try:
+        deadline = time.time() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(url, timeout=PPROF_SECONDS + 30) as r:
+                    Path(out_path).write_bytes(r.read())
+                return True
+            except OSError as e:
+                if time.time() > deadline:
+                    print(f"pprof {pod} failed: {e}", flush=True)
+                    return False
+                time.sleep(1)
+    finally:
+        pf.terminate()
+
+
+def profile_api_servers(delay: float, dest: str, job_name: str, stop: threading.Event) -> None:
+    """HACK: after delay seconds (unless stop is set first), CPU-profile every
+    ate-api-server replica concurrently and upload the profiles to dest."""
+    if stop.wait(delay):
+        return
+    try:
+        pods = subprocess.run(
+            ["kubectl", "get", "pods", "-n", "ate-system", "-l", "app=ate-api-server", "-o", "name"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+    except subprocess.CalledProcessError as e:
+        print(f"pprof: listing ate-api-server pods failed: {e.stderr}", flush=True)
+        return
+    print(f"pprof: capturing {PPROF_SECONDS}s CPU profiles from {pods}", flush=True)
+    outs = {}
+    threads = []
+    for i, pod in enumerate(pods):
+        out = f"/tmp/{job_name}-{pod.split('/')[-1]}.cpu.pprof"
+        t = threading.Thread(
+            target=lambda pod=pod, i=i, out=out: outs.__setitem__(
+                out, capture_api_server_profile(pod, 16060 + i, out)
+            )
+        )
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    for out, ok in outs.items():
+        if ok:
+            run_no_check(["gcloud", "storage", "cp", out, f"{dest}/{Path(out).name}"])
+
+
 def run_test(
     test: dict[str, Any],
     image: str,
@@ -382,8 +522,33 @@ def run_test(
     subprocess.run(
         ["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True
     )
+    top_path = f"/tmp/{job_name}-kubectl-top.txt"
+    top_dest = (
+        f"{dest.rstrip('/')}/runs/{name}/kubectl_top/"
+        f"{time.strftime('%Y-%m-%d', time.gmtime())}-{job_name}.txt"
+    )
+    top = start_top_sampler(top_path)
+    # Profile mid-run, once the user ramp is long over.
+    stop_profile = threading.Event()
+    profiler = threading.Thread(
+        target=profile_api_servers,
+        args=(
+            parse_duration_seconds(test["duration"]) / 2,
+            f"{dest.rstrip('/')}/runs/{name}/pprof/"
+            f"{time.strftime('%Y-%m-%d', time.gmtime())}",
+            job_name,
+            stop_profile,
+        ),
+        daemon=True,
+    )
+    profiler.start()
     timeout = parse_duration_seconds(test["duration"]) + 1800
-    result = wait_for_job(job_name, timeout)
+    try:
+        result = wait_for_job(job_name, timeout)
+    finally:
+        stop_top_sampler(top, top_path, top_dest)
+        stop_profile.set()
+        profiler.join(timeout=PPROF_SECONDS + 120)
     print(f"Job {job_name} result: {result}", flush=True)
     run_no_check(
         ["kubectl", "logs", f"job/{job_name}", "-n", NAMESPACE, "--tail=500"]
@@ -454,7 +619,7 @@ def main() -> None:
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(f"Building commit {commit}", flush=True)
 
-    tests = yaml.safe_load(Path(args.tests).read_text())["tests"]
+    tests = copy.deepcopy(TESTS)
     print(f"Running {len(tests)} test(s)", flush=True)
     try:
         validate_and_normalize_tests(tests)

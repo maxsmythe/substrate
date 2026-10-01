@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -327,6 +329,14 @@ func main() {
 	reflection.Register(mux)
 	ateapipb.RegisterControlServer(mux, controlSrv)
 	ateapipb.RegisterWorkerServiceServer(mux, workerservice.New(persistence, controlSrv, ateletSPIFFEID, actorIDCAPool))
+
+	// HACK: loopback-only pprof for benchmarking; reach it with kubectl
+	// port-forward. serverboot uses its own mux, so pprof stays off :9090.
+	go func() {
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			slog.ErrorContext(ctx, "pprof server exited", slog.Any("err", err))
+		}
+	}()
 
 	readiness := &serverboot.Readiness{}
 	go serverboot.StartMetricsServer(ctx, serverboot.MetricsServerOptions{

@@ -77,3 +77,9 @@ data:
     # and a shorter naptime than the defaults so it stays ahead of writes.
     autovacuum_max_workers = 6
     autovacuum_naptime = 10s
+
+    # Lock-contention diagnostics: log any lock wait longer than
+    # deadlock_timeout with the blocking PIDs, and any statement over 50 ms.
+    log_lock_waits = on
+    deadlock_timeout = 100ms
+    log_min_duration_statement = 50
