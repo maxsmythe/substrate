@@ -121,8 +121,8 @@ func TestRunScriptRejects(t *testing.T) {
 			}
 		})
 	}
-	if n := len(svc.ram); n != 0 {
-		t.Errorf("rejected scripts left %d RAM arrays behind", n)
+	if leftover := len(svc.ram); leftover != 0 {
+		t.Errorf("rejected scripts left %d RAM arrays behind", leftover)
 	}
 }
 

@@ -156,24 +156,24 @@ func (r *runtime) iterate() {
 	gid := boomerutil.GoroutineID()
 	val, loaded := r.users.Load(gid)
 	if !loaded {
-		u, err := r.startUser(context.Background())
+		started, err := r.startUser(context.Background())
 		if err != nil {
 			slog.Warn("agentwalk start failed; goroutine will retry next iter",
 				slog.String("err", err.Error()))
 			r.sleep(2 * time.Second)
 			return
 		}
-		val, _ = r.users.LoadOrStore(gid, u)
+		val, _ = r.users.LoadOrStore(gid, started)
 	}
-	u := val.(*agent)
+	walker := val.(*agent)
 
-	u.step(context.Background())
+	walker.step(context.Background())
 
-	if u.broken {
+	if walker.broken {
 		slog.Warn("agentwalk agent wedged; deleting its actor and starting a fresh one",
-			slog.String("actor", u.actorName),
-			slog.Int("consecutive_failures", u.consecutiveFailures))
-		u.suspendAndDelete(context.Background())
+			slog.String("actor", walker.actorName),
+			slog.Int("consecutive_failures", walker.consecutiveFailures))
+		walker.suspendAndDelete(context.Background())
 		r.users.Delete(gid)
 	}
 }
@@ -183,7 +183,7 @@ func (r *runtime) iterate() {
 // later one, with a wake from suspension. The tick phase is drawn here, so
 // a fleet started together spreads its ticks over the whole interval.
 func (r *runtime) startUser(ctx context.Context) (*agent, error) {
-	u := &agent{
+	walker := &agent{
 		rt:        r,
 		cfg:       r.cfg,
 		actorName: "walk-" + uuid.NewString(),
@@ -191,27 +191,27 @@ func (r *runtime) startUser(ctx context.Context) (*agent, error) {
 		rng:       rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 		epoch:     r.now(),
 	}
-	u.phaseFrac = u.rng.Float64()
-	slog.Info("Creating agentwalk agent", slog.String("actor", u.actorName), slog.String("template", u.template))
+	walker.phaseFrac = walker.rng.Float64()
+	slog.Info("Creating agentwalk agent", slog.String("actor", walker.actorName), slog.String("template", walker.template))
 	bmetrics.UpdateUsers(userClass, 1)
 
-	if err := u.ensureAtespace(ctx); err != nil {
+	if err := walker.ensureAtespace(ctx); err != nil {
 		bmetrics.UpdateUsers(userClass, -1)
 		return nil, fmt.Errorf("ensureAtespace: %w", err)
 	}
-	if err := u.create(ctx); err != nil {
+	if err := walker.create(ctx); err != nil {
 		bmetrics.UpdateUsers(userClass, -1)
 		return nil, fmt.Errorf("createActor: %w", err)
 	}
-	if err := u.waitServing(ctx); err != nil {
+	if err := walker.waitServing(ctx); err != nil {
 		// suspendAndDelete decrements the user gauge; no extra decrement here.
-		u.suspendAndDelete(ctx)
+		walker.suspendAndDelete(ctx)
 		return nil, fmt.Errorf("waitServing: %w", err)
 	}
-	u.ensureIdleCPU(ctx)
+	walker.ensureIdleCPU(ctx)
 	// A failed park is re-driven at the top of the first step.
-	u.hibernate(ctx)
-	return u, nil
+	walker.hibernate(ctx)
+	return walker, nil
 }
 
 // shutdownConcurrency bounds how many agents suspendAndDelete at once.
@@ -232,10 +232,10 @@ func (r *runtime) shutdown(ctx context.Context) {
 			return false
 		}
 		wg.Add(1)
-		go func(u *agent) {
+		go func(walker *agent) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			u.suspendAndDelete(ctx)
+			walker.suspendAndDelete(ctx)
 		}(val.(*agent))
 		return true
 	})
@@ -301,21 +301,21 @@ func (u *agent) step(ctx context.Context) {
 		u.llmCalled = false
 	}
 
-	p := resolve(dynconfig.Get[walkKnobs](u.cfg.Dyn))
-	a := p.pick(u.rng, walkState{actions: u.actions, llmCalled: u.llmCalled})
-	if a != actionDone {
+	knobs := resolve(dynconfig.Get[walkKnobs](u.cfg.Dyn))
+	next := knobs.pick(u.rng, walkState{actions: u.actions, llmCalled: u.llmCalled})
+	if next != actionDone {
 		u.actions++
 	}
-	switch a {
+	switch next {
 	case actionLLM:
-		u.queryLLM(ctx, p)
+		u.queryLLM(ctx, knobs)
 	case actionShort:
-		d := p.shortDuration(u.rng)
-		u.compute(ctx, shortMetric, shortScript(d), d)
+		length := knobs.shortDuration(u.rng)
+		u.compute(ctx, shortMetric, shortScript(length), length)
 	case actionLong:
 		kind := pickLongKind(u.rng)
-		d := p.longDuration(u.rng)
-		u.compute(ctx, longMetricStem+kind.String(), p.longScript(kind, d), d)
+		length := knobs.longDuration(u.rng)
+		u.compute(ctx, longMetricStem+kind.String(), knobs.longScript(kind, length), length)
 	case actionDone:
 		u.endSession(ctx, nil)
 	}
@@ -375,12 +375,12 @@ func (u *agent) wake(ctx context.Context) bool {
 // queryLLM suspends the actor for a think time and wakes it when the
 // answer "arrives". The think time is its own row, so the distribution the
 // fleet ran with can be read off the stats.
-func (u *agent) queryLLM(ctx context.Context, p params) {
+func (u *agent) queryLLM(ctx context.Context, knobs params) {
 	if !u.hibernate(ctx) {
 		u.endSession(ctx, errors.New("suspend before the LLM query failed"))
 		return
 	}
-	think := p.think(u.rng)
+	think := knobs.think(u.rng)
 	u.rt.sleep(think)
 	bmetrics.RecordSuccess(methodActor, thinkMetric, userClass, think, 0)
 	if !u.wake(ctx) {
@@ -500,9 +500,9 @@ func classifyHTTP(status int) boomerutil.FailureAction {
 // mapping of one.
 func (u *agent) noteFailure(err error) {
 	action := boomerutil.ClassifyLifecycleFailure(err)
-	var he *httpError
-	if errors.As(err, &he) {
-		action = classifyHTTP(he.status)
+	var routerErr *httpError
+	if errors.As(err, &routerErr) {
+		action = classifyHTTP(routerErr.status)
 	}
 	switch action {
 	case boomerutil.ReplaceNow:
@@ -566,7 +566,7 @@ func (u *agent) ensureAtespace(ctx context.Context) error {
 				Metadata: &ateapipb.ResourceMetadata{Name: u.cfg.Atespace},
 			},
 		}, grpc.Trailer(tr))
-		if s, ok := status.FromError(err); ok && s.Code() == codes.AlreadyExists {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
 			return nil
 		}
 		return err

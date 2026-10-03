@@ -61,7 +61,7 @@ func onlyWeights(llm, short, long, done float64) func(k *walkKnobs) {
 // The section's defaults resolve to the documented values, and set knobs
 // carry through in the walk's units.
 func TestResolveDefaults(t *testing.T) {
-	p := resolve(walkCodec.Defaults)
+	knobs := resolve(walkCodec.Defaults)
 	want := params{
 		cronInterval: 30 * time.Minute,
 		idleCPU:      0.25,
@@ -75,24 +75,24 @@ func TestResolveDefaults(t *testing.T) {
 		maxActions:   50,
 		template:     "glutton",
 	}
-	if p != want {
-		t.Errorf("resolve(defaults) =\n %+v, want\n %+v", p, want)
+	if knobs != want {
+		t.Errorf("resolve(defaults) =\n %+v, want\n %+v", knobs, want)
 	}
 
-	p = resolve(testKnobs(func(k *walkKnobs) {
+	knobs = resolve(testKnobs(func(k *walkKnobs) {
 		k.CronInterval = dynconfig.Seconds(5 * time.Minute)
 		k.IdleCPU = 0.1
 		k.RAMSize = "1Gi"
 		k.DiskSize = "4Ki"
 		k.Template = "glutton-big"
 	}))
-	if p.cronInterval != 5*time.Minute || p.idleCPU != 0.1 || p.ramSize != 1<<30 || p.diskSize != 4096 || p.template != "glutton-big" {
-		t.Errorf("set knobs did not carry: %+v", p)
+	if knobs.cronInterval != 5*time.Minute || knobs.idleCPU != 0.1 || knobs.ramSize != 1<<30 || knobs.diskSize != 4096 || knobs.template != "glutton-big" {
+		t.Errorf("set knobs did not carry: %+v", knobs)
 	}
 	// A holder built without validation can carry a zero interval; the
 	// tick arithmetic must not divide by it.
-	if p := resolve(testKnobs(func(k *walkKnobs) { k.CronInterval = 0 })); p.cronInterval != 30*time.Minute {
-		t.Errorf("zero interval resolved to %v, want the default", p.cronInterval)
+	if knobs := resolve(testKnobs(func(k *walkKnobs) { k.CronInterval = 0 })); knobs.cronInterval != 30*time.Minute {
+		t.Errorf("zero interval resolved to %v, want the default", knobs.cronInterval)
 	}
 }
 
@@ -127,47 +127,47 @@ func TestValidateKnobs(t *testing.T) {
 // The walk's rules: done is never first, never before an LLM query, and
 // the cap winds a session up with an LLM query first if it owes one.
 func TestPickConstraints(t *testing.T) {
-	r := testRand()
-	p := resolve(testKnobs(onlyWeights(1, 1, 1, 1000)))
+	rng := testRand()
+	knobs := resolve(testKnobs(onlyWeights(1, 1, 1, 1000)))
 	for i := 0; i < 1000; i++ {
-		if a := p.pick(r, walkState{}); a == actionDone {
+		if picked := knobs.pick(rng, walkState{}); picked == actionDone {
 			t.Fatal("done chosen as the first action")
 		}
-		if a := p.pick(r, walkState{actions: 5}); a == actionDone {
+		if picked := knobs.pick(rng, walkState{actions: 5}); picked == actionDone {
 			t.Fatal("done chosen before any LLM query")
 		}
 	}
-	if a := p.pick(r, walkState{actions: 1, llmCalled: true}); a != actionDone {
-		t.Errorf("with done at weight 1000 and eligible, pick = %v", a)
+	if picked := knobs.pick(rng, walkState{actions: 1, llmCalled: true}); picked != actionDone {
+		t.Errorf("with done at weight 1000 and eligible, pick = %v", picked)
 	}
-	if a := p.pick(r, walkState{actions: p.maxActions}); a != actionLLM {
-		t.Errorf("at the cap without an LLM query, pick = %v, want llm", a)
+	if picked := knobs.pick(rng, walkState{actions: knobs.maxActions}); picked != actionLLM {
+		t.Errorf("at the cap without an LLM query, pick = %v, want llm", picked)
 	}
-	if a := p.pick(r, walkState{actions: p.maxActions + 1, llmCalled: true}); a != actionDone {
-		t.Errorf("at the cap after an LLM query, pick = %v, want done", a)
+	if picked := knobs.pick(rng, walkState{actions: knobs.maxActions + 1, llmCalled: true}); picked != actionDone {
+		t.Errorf("at the cap after an LLM query, pick = %v, want done", picked)
 	}
 	// Only done has weight, and done is not allowed yet: the session ends
 	// since nothing else may happen.
 	onlyDone := resolve(testKnobs(onlyWeights(0, 0, 0, 1)))
-	if a := onlyDone.pick(r, walkState{}); a != actionDone {
-		t.Errorf("with nothing eligible, pick = %v, want done", a)
+	if picked := onlyDone.pick(rng, walkState{}); picked != actionDone {
+		t.Errorf("with nothing eligible, pick = %v, want done", picked)
 	}
 }
 
 // The draw follows the weights: a zero weight never comes up, and the
 // shares of a long run land near the configured proportions.
 func TestPickFollowsWeights(t *testing.T) {
-	r := testRand()
-	p := resolve(testKnobs(onlyWeights(60, 40, 0, 0)))
+	rng := testRand()
+	knobs := resolve(testKnobs(onlyWeights(60, 40, 0, 0)))
 	var counts [numActions]int
-	const n = 20000
-	for i := 0; i < n; i++ {
-		counts[p.pick(r, walkState{actions: 3, llmCalled: true})]++
+	const draws = 20000
+	for i := 0; i < draws; i++ {
+		counts[knobs.pick(rng, walkState{actions: 3, llmCalled: true})]++
 	}
 	if counts[actionLong] != 0 || counts[actionDone] != 0 {
 		t.Errorf("zero-weight actions were drawn: %v", counts)
 	}
-	if share := float64(counts[actionLLM]) / n; math.Abs(share-0.6) > 0.02 {
+	if share := float64(counts[actionLLM]) / draws; math.Abs(share-0.6) > 0.02 {
 		t.Errorf("llm share = %.3f, want ~0.6", share)
 	}
 }
@@ -175,35 +175,35 @@ func TestPickFollowsWeights(t *testing.T) {
 // The think time is log-normal with SWE-perf's moments: median near 7.7s,
 // 90th percentile near 23.4s.
 func TestThinkDistribution(t *testing.T) {
-	r := testRand()
-	p := resolve(walkCodec.Defaults)
-	const n = 20000
-	samples := make([]float64, n)
+	rng := testRand()
+	knobs := resolve(walkCodec.Defaults)
+	const draws = 20000
+	samples := make([]float64, draws)
 	for i := range samples {
-		samples[i] = p.think(r).Seconds()
+		samples[i] = knobs.think(rng).Seconds()
 	}
 	sort.Float64s(samples)
-	if med := samples[n/2]; math.Abs(med-7.7) > 0.4 {
+	if med := samples[draws/2]; math.Abs(med-7.7) > 0.4 {
 		t.Errorf("median think = %.2fs, want ~7.7s", med)
 	}
-	if p90 := samples[n*9/10]; math.Abs(p90-23.4) > 1.5 {
+	if p90 := samples[draws*9/10]; math.Abs(p90-23.4) > 1.5 {
 		t.Errorf("p90 think = %.2fs, want ~23.4s", p90)
 	}
 }
 
 // Operation lengths stay within the spread around their means.
 func TestDurationSpread(t *testing.T) {
-	r := testRand()
-	p := resolve(testKnobs(func(k *walkKnobs) {
+	rng := testRand()
+	knobs := resolve(testKnobs(func(k *walkKnobs) {
 		k.ShortSeconds = dynconfig.Seconds(10 * time.Second)
 		k.LongSeconds = dynconfig.Seconds(100 * time.Second)
 	}))
 	for i := 0; i < 1000; i++ {
-		if d := p.shortDuration(r); d < 5*time.Second || d > 15*time.Second {
-			t.Fatalf("short duration %v outside [5s, 15s]", d)
+		if length := knobs.shortDuration(rng); length < 5*time.Second || length > 15*time.Second {
+			t.Fatalf("short duration %v outside [5s, 15s]", length)
 		}
-		if d := p.longDuration(r); d < 50*time.Second || d > 150*time.Second {
-			t.Fatalf("long duration %v outside [50s, 150s]", d)
+		if length := knobs.longDuration(rng); length < 50*time.Second || length > 150*time.Second {
+			t.Fatalf("long duration %v outside [50s, 150s]", length)
 		}
 	}
 }
@@ -212,41 +212,41 @@ func TestDurationSpread(t *testing.T) {
 // burn for CPU, a paced write/read loop bounded by the duration for disk
 // and RAM, sized by the knobs.
 func TestScripts(t *testing.T) {
-	p := resolve(testKnobs(func(k *walkKnobs) { k.RAMSize, k.DiskSize = "8Mi", "2Mi" }))
+	knobs := resolve(testKnobs(func(k *walkKnobs) { k.RAMSize, k.DiskSize = "8Mi", "2Mi" }))
 
 	short := shortScript(6 * time.Second)
 	if short.GetLoopDurationMs() != 0 || len(short.GetOps()) != 1 {
 		t.Fatalf("short script = %v, want one op and no loop", short)
 	}
-	if b := short.GetOps()[0].GetBurnCpu(); b.GetDurationMs() != 6000 || b.GetParallelism() != 1 {
-		t.Errorf("short burn = %v, want 6000ms x1", b)
+	if burn := short.GetOps()[0].GetBurnCpu(); burn.GetDurationMs() != 6000 || burn.GetParallelism() != 1 {
+		t.Errorf("short burn = %v, want 6000ms x1", burn)
 	}
 
-	cpu := p.longScript(longCPU, time.Minute)
-	if b := cpu.GetOps()[0].GetBurnCpu(); cpu.GetLoopDurationMs() != 0 || b.GetDurationMs() != 60000 || b.GetParallelism() != longCPUParallelism {
+	cpu := knobs.longScript(longCPU, time.Minute)
+	if burn := cpu.GetOps()[0].GetBurnCpu(); cpu.GetLoopDurationMs() != 0 || burn.GetDurationMs() != 60000 || burn.GetParallelism() != longCPUParallelism {
 		t.Errorf("long cpu script = %v, want one 60000ms x%d burn", cpu, longCPUParallelism)
 	}
 
-	disk := p.longScript(longDisk, time.Minute)
+	disk := knobs.longScript(longDisk, time.Minute)
 	if disk.GetLoopDurationMs() != 60000 || len(disk.GetOps()) != 3 {
 		t.Fatalf("long disk script = %v, want a 60000ms loop of 3 ops", disk)
 	}
-	if w := disk.GetOps()[0].GetWriteDisk(); w.GetKey() != diskKey || w.GetSize() != 2<<20 {
-		t.Errorf("disk write = %v, want %s of 2Mi", w, diskKey)
+	if write := disk.GetOps()[0].GetWriteDisk(); write.GetKey() != diskKey || write.GetSize() != 2<<20 {
+		t.Errorf("disk write = %v, want %s of 2Mi", write, diskKey)
 	}
 	if rd := disk.GetOps()[1].GetReadDisk(); rd.GetKey() != diskKey || rd.GetReadMode() != gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY {
 		t.Errorf("disk read = %v, want a digest-only read of %s", rd, diskKey)
 	}
-	if s := disk.GetOps()[2].GetSleep(); s.GetDurationMs() != loopPause.Milliseconds() {
-		t.Errorf("disk pause = %v, want %v", s, loopPause)
+	if pause := disk.GetOps()[2].GetSleep(); pause.GetDurationMs() != loopPause.Milliseconds() {
+		t.Errorf("disk pause = %v, want %v", pause, loopPause)
 	}
 
-	ram := p.longScript(longRAM, 30*time.Second)
+	ram := knobs.longScript(longRAM, 30*time.Second)
 	if ram.GetLoopDurationMs() != 30000 || len(ram.GetOps()) != 3 {
 		t.Fatalf("long ram script = %v, want a 30000ms loop of 3 ops", ram)
 	}
-	if w := ram.GetOps()[0].GetWriteRam(); w.GetKey() != ramKey || w.GetSize() != "8388608" || w.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE {
-		t.Errorf("ram write = %v, want an OVERWRITE of 8Mi at %s", w, ramKey)
+	if write := ram.GetOps()[0].GetWriteRam(); write.GetKey() != ramKey || write.GetSize() != "8388608" || write.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE {
+		t.Errorf("ram write = %v, want an OVERWRITE of 8Mi at %s", write, ramKey)
 	}
 	if rd := ram.GetOps()[1].GetReadRam(); rd.GetKey() != ramKey {
 		t.Errorf("ram read = %v, want a walk of %s", rd, ramKey)
@@ -280,26 +280,26 @@ func TestNextTick(t *testing.T) {
 func TestWaitForTickFollowsTheIntervalKnob(t *testing.T) {
 	clk := &fakeClock{t: time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)}
 	cfg := &userclass.Config{Dyn: dynconfig.Static(testKnobs(func(k *walkKnobs) { k.CronInterval = dynconfig.Seconds(time.Hour) }))}
-	u := &agent{
+	walker := &agent{
 		rt:        &runtime{now: clk.now, sleep: clk.sleep},
 		cfg:       cfg,
 		epoch:     clk.t,
 		phaseFrac: 0.5, // tick at +30m under the hour, at +1m under the 2m set below
 	}
-	clk.onSleep = func(n int) {
-		if n == 3 {
+	clk.onSleep = func(sleeps int) {
+		if sleeps == 3 {
 			cfg.Dyn = dynconfig.Static(testKnobs(func(k *walkKnobs) { k.CronInterval = dynconfig.Seconds(2 * time.Minute) }))
 		}
 	}
-	u.waitForTick()
+	walker.waitForTick()
 	// Three 10s slices under the hour-long interval, then the tick under
 	// the 2m interval is at +1m: the wait ends there, not at +30m.
-	if got := clk.t.Sub(u.epoch); got != time.Minute {
+	if got := clk.t.Sub(walker.epoch); got != time.Minute {
 		t.Errorf("waited until +%v, want +1m", got)
 	}
 	// The next tick under 2m is at +3m: one 10s slice, then the remainder.
-	u.waitForTick()
-	if got := clk.t.Sub(u.epoch); got != 3*time.Minute {
+	walker.waitForTick()
+	if got := clk.t.Sub(walker.epoch); got != 3*time.Minute {
 		t.Errorf("second wait ended at +%v, want +3m", got)
 	}
 }
@@ -310,14 +310,14 @@ func TestWaitForTickFollowsTheIntervalKnob(t *testing.T) {
 func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 	srv := &fake.Server{}
 	ctl := &fakeControlClient{}
-	u := newTestAgent(t, srv, ctl, testKnobs(func(k *walkKnobs) {
+	walker := newTestAgent(t, srv, ctl, testKnobs(func(k *walkKnobs) {
 		onlyWeights(0, 1, 0, 0)(k)
 		k.MaxActions = 1
 	}))
 
-	u.step(context.Background()) // tick: wake + short compute
-	if !u.active || u.actions != 1 || u.llmCalled {
-		t.Fatalf("after step 1: active=%v actions=%d llmCalled=%v", u.active, u.actions, u.llmCalled)
+	walker.step(context.Background()) // tick: wake + short compute
+	if !walker.active || walker.actions != 1 || walker.llmCalled {
+		t.Fatalf("after step 1: active=%v actions=%d llmCalled=%v", walker.active, walker.actions, walker.llmCalled)
 	}
 	scripts := srv.RecordedScripts()
 	if len(scripts) != 1 || scripts[0].GetOps()[0].GetBurnCpu() == nil {
@@ -327,13 +327,13 @@ func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 		t.Errorf("idle CPU requests = %v, want one of 1 core at 0.25", cpu)
 	}
 
-	u.step(context.Background()) // cap reached, LLM owed: suspend, think, wake
-	if !u.llmCalled || u.actions != 2 || !u.active {
-		t.Fatalf("after step 2: active=%v actions=%d llmCalled=%v", u.active, u.actions, u.llmCalled)
+	walker.step(context.Background()) // cap reached, LLM owed: suspend, think, wake
+	if !walker.llmCalled || walker.actions != 2 || !walker.active {
+		t.Fatalf("after step 2: active=%v actions=%d llmCalled=%v", walker.active, walker.actions, walker.llmCalled)
 	}
 
-	u.step(context.Background()) // cap reached, LLM done: done
-	if u.active {
+	walker.step(context.Background()) // cap reached, LLM done: done
+	if walker.active {
 		t.Fatal("after step 3: still active")
 	}
 
@@ -350,14 +350,14 @@ func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 	if got := ctl.recordedCalls(); !slices.Equal(got, wantCalls) {
 		t.Errorf("control calls = %v, want %v", got, wantCalls)
 	}
-	if u.broken || u.consecutiveFailures != 0 {
-		t.Errorf("clean session left broken=%v failures=%d", u.broken, u.consecutiveFailures)
+	if walker.broken || walker.consecutiveFailures != 0 {
+		t.Errorf("clean session left broken=%v failures=%d", walker.broken, walker.consecutiveFailures)
 	}
 
 	// The next step waits out the cron and starts a new session.
-	u.step(context.Background())
-	if !u.active || u.actions != 1 {
-		t.Errorf("after the next tick: active=%v actions=%d, want a fresh session", u.active, u.actions)
+	walker.step(context.Background())
+	if !walker.active || walker.actions != 1 {
+		t.Errorf("after the next tick: active=%v actions=%d, want a fresh session", walker.active, walker.actions)
 	}
 }
 
@@ -366,12 +366,12 @@ func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 func TestExplicitResumeWakes(t *testing.T) {
 	srv := &fake.Server{}
 	ctl := &fakeControlClient{}
-	u := newTestAgent(t, srv, ctl, testKnobs(func(k *walkKnobs) {
+	walker := newTestAgent(t, srv, ctl, testKnobs(func(k *walkKnobs) {
 		k.ResumeMode = dynconfig.ResumeModeExplicit
 		onlyWeights(1, 0, 0, 0)(k)
 		k.MaxActions = 1
 	}))
-	u.step(context.Background()) // tick + LLM
+	walker.step(context.Background()) // tick + LLM
 	want := []string{"ResumeActor", "SuspendActor", "ResumeActor"}
 	if got := ctl.recordedCalls(); !slices.Equal(got, want) {
 		t.Errorf("control calls = %v, want %v", got, want)
@@ -383,10 +383,10 @@ func TestExplicitResumeWakes(t *testing.T) {
 // its next tick.
 func TestWakeFailureKeepsActorThroughRouterCapacityErrors(t *testing.T) {
 	ctl := &fakeControlClient{}
-	u := newTestAgent(t, &fake.Server{Status: http.StatusServiceUnavailable}, ctl, testKnobs(nil))
-	u.step(context.Background())
-	if u.active || u.broken || u.consecutiveFailures != 0 {
-		t.Errorf("after a 503 wake: active=%v broken=%v failures=%d, want dormant and kept", u.active, u.broken, u.consecutiveFailures)
+	walker := newTestAgent(t, &fake.Server{Status: http.StatusServiceUnavailable}, ctl, testKnobs(nil))
+	walker.step(context.Background())
+	if walker.active || walker.broken || walker.consecutiveFailures != 0 {
+		t.Errorf("after a 503 wake: active=%v broken=%v failures=%d, want dormant and kept", walker.active, walker.broken, walker.consecutiveFailures)
 	}
 	if got := ctl.recordedCalls(); !slices.Equal(got, []string{"SuspendActor"}) {
 		t.Errorf("control calls = %v, want the re-park only", got)
@@ -395,9 +395,9 @@ func TestWakeFailureKeepsActorThroughRouterCapacityErrors(t *testing.T) {
 
 // 404 from the router means the actor record is gone: replace at once.
 func TestWakeFailureReplacesActorOnRouterNotFound(t *testing.T) {
-	u := newTestAgent(t, &fake.Server{Status: http.StatusNotFound}, &fakeControlClient{}, testKnobs(nil))
-	u.step(context.Background())
-	if !u.broken {
+	walker := newTestAgent(t, &fake.Server{Status: http.StatusNotFound}, &fakeControlClient{}, testKnobs(nil))
+	walker.step(context.Background())
+	if !walker.broken {
 		t.Error("broken = false after a 404 wake; want immediate replacement")
 	}
 }
@@ -406,10 +406,10 @@ func TestWakeFailureReplacesActorOnRouterNotFound(t *testing.T) {
 // agent must replace it on the first failure.
 func TestCrashedActorIsReplacedImmediately(t *testing.T) {
 	ctl := &fakeControlClient{resumeErrs: []error{status.Error(codes.Aborted, "actor benchmark/walk-test crashed")}}
-	u := newTestAgent(t, &fake.Server{}, ctl, testKnobs(func(k *walkKnobs) { k.ResumeMode = dynconfig.ResumeModeExplicit }))
-	u.step(context.Background())
-	if !u.broken || u.active {
-		t.Errorf("after a crashed verdict: broken=%v active=%v, want true/false", u.broken, u.active)
+	walker := newTestAgent(t, &fake.Server{}, ctl, testKnobs(func(k *walkKnobs) { k.ResumeMode = dynconfig.ResumeModeExplicit }))
+	walker.step(context.Background())
+	if !walker.broken || walker.active {
+		t.Errorf("after a crashed verdict: broken=%v active=%v, want true/false", walker.broken, walker.active)
 	}
 }
 
@@ -418,15 +418,15 @@ func TestCrashedActorIsReplacedImmediately(t *testing.T) {
 func TestComputeFailureEndsSessionAndCounts(t *testing.T) {
 	srv := &fake.Server{}
 	ctl := &fakeControlClient{}
-	u := newTestAgent(t, srv, ctl, testKnobs(onlyWeights(0, 1, 0, 0)))
-	u.step(context.Background()) // tick + a short compute that succeeds
-	if !u.active {
+	walker := newTestAgent(t, srv, ctl, testKnobs(onlyWeights(0, 1, 0, 0)))
+	walker.step(context.Background()) // tick + a short compute that succeeds
+	if !walker.active {
 		t.Fatal("first step did not start a session")
 	}
 	srv.Status = http.StatusInternalServerError
-	u.step(context.Background())
-	if u.active || u.consecutiveFailures != 1 || u.broken {
-		t.Errorf("after a failed compute: active=%v failures=%d broken=%v, want dormant, 1, false", u.active, u.consecutiveFailures, u.broken)
+	walker.step(context.Background())
+	if walker.active || walker.consecutiveFailures != 1 || walker.broken {
+		t.Errorf("after a failed compute: active=%v failures=%d broken=%v, want dormant, 1, false", walker.active, walker.consecutiveFailures, walker.broken)
 	}
 	if got := ctl.recordedCalls(); !slices.Equal(got, []string{"SuspendActor"}) {
 		t.Errorf("control calls = %v, want one park at session end", got)
@@ -439,17 +439,17 @@ func TestComputeFailureEndsSessionAndCounts(t *testing.T) {
 func TestStrandedHibernateIsRedriven(t *testing.T) {
 	srv := &fake.Server{}
 	ctl := &fakeControlClient{suspendErrs: []error{status.Error(codes.Unavailable, "ate-api-server restarting")}}
-	u := newTestAgent(t, srv, ctl, testKnobs(onlyWeights(1, 0, 0, 0)))
+	walker := newTestAgent(t, srv, ctl, testKnobs(onlyWeights(1, 0, 0, 0)))
 
-	u.step(context.Background()) // tick wake, then the LLM's suspend fails
-	if u.active || !u.hibernatePending || u.broken {
-		t.Fatalf("after failed suspend: active=%v hibernatePending=%v broken=%v, want false/true/false", u.active, u.hibernatePending, u.broken)
+	walker.step(context.Background()) // tick wake, then the LLM's suspend fails
+	if walker.active || !walker.hibernatePending || walker.broken {
+		t.Fatalf("after failed suspend: active=%v hibernatePending=%v broken=%v, want false/true/false", walker.active, walker.hibernatePending, walker.broken)
 	}
 	served := len(srv.RecordedPaths())
 
-	u.step(context.Background()) // re-drive the suspend only
-	if u.hibernatePending || u.active {
-		t.Errorf("after re-drive: hibernatePending=%v active=%v, want false/false", u.hibernatePending, u.active)
+	walker.step(context.Background()) // re-drive the suspend only
+	if walker.hibernatePending || walker.active {
+		t.Errorf("after re-drive: hibernatePending=%v active=%v, want false/false", walker.hibernatePending, walker.active)
 	}
 	if got := len(srv.RecordedPaths()); got != served {
 		t.Errorf("router requests = %d, want %d (no wake against a stranded actor)", got, served)
@@ -463,8 +463,8 @@ func TestStrandedHibernateIsRedriven(t *testing.T) {
 // cannot park the VU goroutine for the rest of the run.
 func TestControlRPCsCarryADeadline(t *testing.T) {
 	ctl := &fakeControlClient{}
-	u := newTestAgent(t, &fake.Server{}, ctl, testKnobs(nil))
-	u.hibernate(context.Background())
+	walker := newTestAgent(t, &fake.Server{}, ctl, testKnobs(nil))
+	walker.hibernate(context.Background())
 	if !ctl.sawDeadline {
 		t.Error("SuspendActor arrived without a deadline")
 	}
@@ -480,14 +480,14 @@ func TestShutdownFansOut(t *testing.T) {
 		APIStub: ctl, HTTPClient: ts.Client(), RouterURL: ts.URL, Atespace: "benchmark",
 		Dyn: dynconfig.Static(testKnobs(nil)), Tracer: otel.Tracer("test"),
 	})
-	const n = 8
-	for i := 0; i < n; i++ {
+	const agents = 8
+	for i := 0; i < agents; i++ {
 		rt.users.Store(i, &agent{rt: rt, cfg: rt.cfg, actorName: "walk-" + string(rune('a'+i))})
 	}
 	start := time.Now()
 	rt.shutdown(context.Background())
-	if elapsed := time.Since(start); elapsed > n*ctl.deleteDelay/2 {
-		t.Errorf("shutdown took %v for %d agents; a serial sweep would take %v", elapsed, n, n*ctl.deleteDelay)
+	if elapsed := time.Since(start); elapsed > agents*ctl.deleteDelay/2 {
+		t.Errorf("shutdown took %v for %d agents; a serial sweep would take %v", elapsed, agents, agents*ctl.deleteDelay)
 	}
 	if got := ctl.maxInFlight.Load(); got < 2 {
 		t.Errorf("max concurrent DeleteActor = %d, want > 1", got)
@@ -498,12 +498,12 @@ func TestShutdownFansOut(t *testing.T) {
 type fakeClock struct {
 	t       time.Time
 	sleeps  int
-	onSleep func(n int)
+	onSleep func(sleeps int)
 }
 
 func (c *fakeClock) now() time.Time { return c.t }
-func (c *fakeClock) sleep(d time.Duration) {
-	c.t = c.t.Add(d)
+func (c *fakeClock) sleep(duration time.Duration) {
+	c.t = c.t.Add(duration)
 	c.sleeps++
 	if c.onSleep != nil {
 		c.onSleep(c.sleeps)
@@ -605,11 +605,11 @@ func (f *fakeControlClient) PauseActor(ctx context.Context, in *ateapipb.PauseAc
 
 func (f *fakeControlClient) DeleteActor(ctx context.Context, in *ateapipb.DeleteActorRequest, opts ...grpc.CallOption) (*ateapipb.Actor, error) {
 	f.record(ctx, "DeleteActor")
-	n := f.inFlight.Add(1)
+	concurrent := f.inFlight.Add(1)
 	defer f.inFlight.Add(-1)
 	for {
 		cur := f.maxInFlight.Load()
-		if n <= cur || f.maxInFlight.CompareAndSwap(cur, n) {
+		if concurrent <= cur || f.maxInFlight.CompareAndSwap(cur, concurrent) {
 			break
 		}
 	}

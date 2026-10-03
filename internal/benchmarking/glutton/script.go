@@ -81,11 +81,11 @@ func validateScript(req *gluttonpb.RunScriptRequest) error {
 		return status.Error(codes.InvalidArgument, "loop_duration_ms must be non-negative")
 	}
 	for i, op := range req.GetOps() {
-		switch o := op.GetOp().(type) {
+		switch typed := op.GetOp().(type) {
 		case nil:
 			return status.Errorf(codes.InvalidArgument, "op %d: no op set", i)
 		case *gluttonpb.ScriptOp_Sleep:
-			if o.Sleep.GetDurationMs() < 0 {
+			if typed.Sleep.GetDurationMs() < 0 {
 				return status.Errorf(codes.InvalidArgument, "op %d (sleep): duration_ms must be non-negative", i)
 			}
 		}
@@ -98,37 +98,37 @@ func validateScript(req *gluttonpb.RunScriptRequest) error {
 // count would only be shipped back to a caller who asked for timings.
 func (s *Service) runOp(ctx context.Context, op *gluttonpb.ScriptOp) error {
 	var err error
-	switch o := op.GetOp().(type) {
+	switch typed := op.GetOp().(type) {
 	case *gluttonpb.ScriptOp_WriteRam:
-		_, err = s.WriteRAM(ctx, o.WriteRam)
+		_, err = s.WriteRAM(ctx, typed.WriteRam)
 	case *gluttonpb.ScriptOp_ReadRam:
-		_, err = s.ReadRAM(ctx, o.ReadRam)
+		_, err = s.ReadRAM(ctx, typed.ReadRam)
 	case *gluttonpb.ScriptOp_WriteDisk:
-		_, err = s.WriteDisk(ctx, o.WriteDisk)
+		_, err = s.WriteDisk(ctx, typed.WriteDisk)
 	case *gluttonpb.ScriptOp_ReadDisk:
-		_, err = s.ReadDisk(ctx, o.ReadDisk)
+		_, err = s.ReadDisk(ctx, typed.ReadDisk)
 	case *gluttonpb.ScriptOp_BurnCpu:
-		_, err = s.BurnCPU(ctx, o.BurnCpu)
+		_, err = s.BurnCPU(ctx, typed.BurnCpu)
 	case *gluttonpb.ScriptOp_UseCpu:
-		_, err = s.UseCPU(ctx, o.UseCpu)
+		_, err = s.UseCPU(ctx, typed.UseCpu)
 	case *gluttonpb.ScriptOp_Ingest:
-		_, err = s.Ingest(ctx, o.Ingest)
+		_, err = s.Ingest(ctx, typed.Ingest)
 	case *gluttonpb.ScriptOp_OpenFd:
-		_, err = s.OpenFD(ctx, o.OpenFd)
+		_, err = s.OpenFD(ctx, typed.OpenFd)
 	case *gluttonpb.ScriptOp_Sleep:
-		err = sleep(ctx, time.Duration(o.Sleep.GetDurationMs())*time.Millisecond)
+		err = sleep(ctx, time.Duration(typed.Sleep.GetDurationMs())*time.Millisecond)
 	default:
-		err = status.Errorf(codes.InvalidArgument, "unknown op %T", o)
+		err = status.Errorf(codes.InvalidArgument, "unknown op %T", typed)
 	}
 	return err
 }
 
-// sleep idles for d or until ctx ends, whichever comes first.
-func sleep(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
+// sleep idles for duration or until ctx ends, whichever comes first.
+func sleep(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
 		return nil
 	}
-	timer := time.NewTimer(d)
+	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
 	case <-timer.C:

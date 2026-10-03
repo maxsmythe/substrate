@@ -148,11 +148,11 @@ func parseSize(text string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	n, ok := quantity.AsInt64()
-	if !ok || n <= 0 {
+	bytes, ok := quantity.AsInt64()
+	if !ok || bytes <= 0 {
 		return 0, fmt.Errorf("%q is not a positive whole byte count", text)
 	}
-	return n, nil
+	return bytes, nil
 }
 
 const (
@@ -250,30 +250,30 @@ type params struct {
 // store, so the sizes parse and the interval is positive; a holder built
 // without validation (a test's) that breaks either falls back to that
 // one default, since a zero interval would break the tick arithmetic.
-func resolve(c walkKnobs) params {
-	p := params{
-		cronInterval: c.CronInterval.Duration(),
-		idleCPU:      c.IdleCPU,
-		weights:      [numActions]float64{c.WeightLLM, c.WeightShort, c.WeightLong, c.WeightDone},
-		thinkMu:      c.ThinkMu,
-		thinkSigma:   c.ThinkSigma,
-		shortMean:    c.ShortSeconds.Duration(),
-		longMean:     c.LongSeconds.Duration(),
-		maxActions:   c.MaxActions,
-		template:     c.Template,
+func resolve(cfg walkKnobs) params {
+	resolved := params{
+		cronInterval: cfg.CronInterval.Duration(),
+		idleCPU:      cfg.IdleCPU,
+		weights:      [numActions]float64{cfg.WeightLLM, cfg.WeightShort, cfg.WeightLong, cfg.WeightDone},
+		thinkMu:      cfg.ThinkMu,
+		thinkSigma:   cfg.ThinkSigma,
+		shortMean:    cfg.ShortSeconds.Duration(),
+		longMean:     cfg.LongSeconds.Duration(),
+		maxActions:   cfg.MaxActions,
+		template:     cfg.Template,
 	}
-	if p.cronInterval <= 0 {
-		p.cronInterval = walkCodec.Defaults.CronInterval.Duration()
+	if resolved.cronInterval <= 0 {
+		resolved.cronInterval = walkCodec.Defaults.CronInterval.Duration()
 	}
-	p.ramSize, _ = parseSize(walkCodec.Defaults.RAMSize)
-	if n, err := parseSize(c.RAMSize); err == nil {
-		p.ramSize = n
+	resolved.ramSize, _ = parseSize(walkCodec.Defaults.RAMSize)
+	if ramBytes, err := parseSize(cfg.RAMSize); err == nil {
+		resolved.ramSize = ramBytes
 	}
-	p.diskSize, _ = parseSize(walkCodec.Defaults.DiskSize)
-	if n, err := parseSize(c.DiskSize); err == nil && n <= math.MaxInt32 {
-		p.diskSize = n
+	resolved.diskSize, _ = parseSize(walkCodec.Defaults.DiskSize)
+	if diskBytes, err := parseSize(cfg.DiskSize); err == nil && diskBytes <= math.MaxInt32 {
+		resolved.diskSize = diskBytes
 	}
-	return p
+	return resolved
 }
 
 // walkState is what constrains the next pick: how many actions the session
@@ -288,85 +288,85 @@ type walkState struct {
 // one LLM query first if none has happened. Among the eligible actions the
 // draw is proportional to the weights; if none of them has weight, the
 // session ends, since there is nothing else it is allowed to do.
-func (p params) pick(r *rand.Rand, st walkState) action {
-	if st.actions >= p.maxActions {
-		if !st.llmCalled {
+func (p params) pick(rng *rand.Rand, state walkState) action {
+	if state.actions >= p.maxActions {
+		if !state.llmCalled {
 			return actionLLM
 		}
 		return actionDone
 	}
 	var total float64
 	for a := action(0); a < numActions; a++ {
-		if p.eligible(a, st) {
+		if p.eligible(a, state) {
 			total += p.weights[a]
 		}
 	}
 	if total <= 0 {
 		return actionDone
 	}
-	x := r.Float64() * total
+	draw := rng.Float64() * total
 	for a := action(0); a < numActions; a++ {
-		if !p.eligible(a, st) {
+		if !p.eligible(a, state) {
 			continue
 		}
-		x -= p.weights[a]
-		if x < 0 {
+		draw -= p.weights[a]
+		if draw < 0 {
 			return a
 		}
 	}
 	// Float rounding at the very top of the range lands on the last
-	// eligible action, which the loop above would have returned had x
-	// been a hair smaller.
+	// eligible action, which the loop above would have returned had the
+	// draw been a hair smaller.
 	for a := numActions - 1; a >= 0; a-- {
-		if p.eligible(a, st) && p.weights[a] > 0 {
+		if p.eligible(a, state) && p.weights[a] > 0 {
 			return a
 		}
 	}
 	return actionDone
 }
 
-func (p params) eligible(a action, st walkState) bool {
-	if a == actionDone {
-		return st.actions > 0 && st.llmCalled
+func (p params) eligible(candidate action, state walkState) bool {
+	if candidate == actionDone {
+		return state.actions > 0 && state.llmCalled
 	}
 	return true
 }
 
 // think draws an LLM round trip: log-normal in seconds.
-func (p params) think(r *rand.Rand) time.Duration {
-	secs := math.Exp(p.thinkMu + p.thinkSigma*r.NormFloat64())
+func (p params) think(rng *rand.Rand) time.Duration {
+	secs := math.Exp(p.thinkMu + p.thinkSigma*rng.NormFloat64())
 	return time.Duration(secs * float64(time.Second))
 }
 
 // shortDuration and longDuration draw an operation's length around its mean.
-func (p params) shortDuration(r *rand.Rand) time.Duration { return spread(r, p.shortMean) }
-func (p params) longDuration(r *rand.Rand) time.Duration  { return spread(r, p.longMean) }
+func (p params) shortDuration(rng *rand.Rand) time.Duration { return spread(rng, p.shortMean) }
+func (p params) longDuration(rng *rand.Rand) time.Duration  { return spread(rng, p.longMean) }
 
-func spread(r *rand.Rand, mean time.Duration) time.Duration {
-	f := 1 - durationSpread + 2*durationSpread*r.Float64()
-	return time.Duration(float64(mean) * f)
+func spread(rng *rand.Rand, mean time.Duration) time.Duration {
+	factor := 1 - durationSpread + 2*durationSpread*rng.Float64()
+	return time.Duration(float64(mean) * factor)
 }
 
 // pickLongKind chooses the resource of a long operation, each as likely as
 // the others.
-func pickLongKind(r *rand.Rand) longKind {
-	return longKind(r.IntN(int(numLongKinds)))
+func pickLongKind(rng *rand.Rand) longKind {
+	return longKind(rng.IntN(int(numLongKinds)))
 }
 
 // shortScript is a short compute burst: one goroutine spinning for d.
-func shortScript(d time.Duration) *gluttonpb.RunScriptRequest {
-	return &gluttonpb.RunScriptRequest{Ops: []*gluttonpb.ScriptOp{burnOp(d, 1)}}
+func shortScript(length time.Duration) *gluttonpb.RunScriptRequest {
+	return &gluttonpb.RunScriptRequest{Ops: []*gluttonpb.ScriptOp{burnOp(length, 1)}}
 }
 
 // longScript is a long operation of the given kind lasting about d. CPU is
 // one burn across longCPUParallelism goroutines. Disk rewrites and re-reads
 // a scratch file, RAM re-randomizes and walks a working set, each looped
 // with a pause until d elapses.
-func (p params) longScript(kind longKind, d time.Duration) *gluttonpb.RunScriptRequest {
+func (p params) longScript(kind longKind, length time.Duration) *gluttonpb.RunScriptRequest {
 	switch kind {
 	case longDisk:
 		return &gluttonpb.RunScriptRequest{
-			LoopDurationMs: d.Milliseconds(),
+			LoopDurationMs: length.Milliseconds(),
 			Ops: []*gluttonpb.ScriptOp{
 				{Op: &gluttonpb.ScriptOp_WriteDisk{WriteDisk: &gluttonpb.WriteDiskRequest{
 					Key: diskKey, Size: int32(p.diskSize), WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE}}},
@@ -380,7 +380,7 @@ func (p params) longScript(kind longKind, d time.Duration) *gluttonpb.RunScriptR
 		// place after, so the working set is allocated once per actor and
 		// dirtied on every pass.
 		return &gluttonpb.RunScriptRequest{
-			LoopDurationMs: d.Milliseconds(),
+			LoopDurationMs: length.Milliseconds(),
 			Ops: []*gluttonpb.ScriptOp{
 				{Op: &gluttonpb.ScriptOp_WriteRam{WriteRam: &gluttonpb.WriteRAMRequest{
 					Key: ramKey, Size: fmt.Sprintf("%d", p.ramSize), WriteMode: gluttonpb.WriteMode_WRITE_MODE_OVERWRITE}}},
@@ -389,17 +389,17 @@ func (p params) longScript(kind longKind, d time.Duration) *gluttonpb.RunScriptR
 			},
 		}
 	default:
-		return &gluttonpb.RunScriptRequest{Ops: []*gluttonpb.ScriptOp{burnOp(d, longCPUParallelism)}}
+		return &gluttonpb.RunScriptRequest{Ops: []*gluttonpb.ScriptOp{burnOp(length, longCPUParallelism)}}
 	}
 }
 
-func burnOp(d time.Duration, parallelism int32) *gluttonpb.ScriptOp {
+func burnOp(length time.Duration, parallelism int32) *gluttonpb.ScriptOp {
 	return &gluttonpb.ScriptOp{Op: &gluttonpb.ScriptOp_BurnCpu{BurnCpu: &gluttonpb.BurnCPURequest{
-		DurationMs: d.Milliseconds(), Parallelism: parallelism}}}
+		DurationMs: length.Milliseconds(), Parallelism: parallelism}}}
 }
 
-func sleepOp(d time.Duration) *gluttonpb.ScriptOp {
-	return &gluttonpb.ScriptOp{Op: &gluttonpb.ScriptOp_Sleep{Sleep: &gluttonpb.SleepRequest{DurationMs: d.Milliseconds()}}}
+func sleepOp(length time.Duration) *gluttonpb.ScriptOp {
+	return &gluttonpb.ScriptOp{Op: &gluttonpb.ScriptOp_Sleep{Sleep: &gluttonpb.SleepRequest{DurationMs: length.Milliseconds()}}}
 }
 
 // nextTick is the first cron tick strictly after now. Ticks fall at
@@ -412,6 +412,6 @@ func nextTick(epoch time.Time, phase, interval time.Duration, now time.Time) tim
 		return first
 	}
 	elapsed := now.Sub(first)
-	k := elapsed/interval + 1
-	return first.Add(k * interval)
+	ticksPast := elapsed/interval + 1
+	return first.Add(ticksPast * interval)
 }
