@@ -41,6 +41,7 @@ const (
 	IngestRoute    = glutton.IngestRoute
 	PingRoute      = glutton.PingRoute
 	UseCPURoute    = glutton.UseCPURoute
+	RunScriptRoute = glutton.RunScriptRoute
 )
 
 // Server is an httptest-backed stand-in for a glutton actor holding one file.
@@ -72,6 +73,7 @@ type Server struct {
 	burnMillis    []int64
 	ingestSizes   []int64
 	cpuRequests   []*gluttonpb.UseCPURequest
+	scripts       []*gluttonpb.RunScriptRequest
 }
 
 func (s *Server) reportedDigest() []byte {
@@ -133,6 +135,13 @@ func (s *Server) RecordedRAMReadSizes() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.ramReadSizes...)
+}
+
+// RecordedScripts returns each /runscript request.
+func (s *Server) RecordedScripts() []*gluttonpb.RunScriptRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*gluttonpb.RunScriptRequest(nil), s.scripts...)
 }
 
 // RecordedCPURequests returns each /usecpu request.
@@ -315,6 +324,25 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 
 		resp, _ := proto.Marshal(&gluttonpb.UseCPUResponse{NumCores: req.GetNumCores()})
+		_, _ = w.Write(resp)
+
+	case RunScriptRoute:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var req gluttonpb.RunScriptRequest
+		if err := proto.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		s.scripts = append(s.scripts, &req)
+		s.mu.Unlock()
+
+		// The fake does no work, so the script is instant: one pass, every op run.
+		resp, _ := proto.Marshal(&gluttonpb.RunScriptResponse{Passes: 1, OpsRun: int64(len(req.GetOps()))})
 		_, _ = w.Write(resp)
 
 	default:

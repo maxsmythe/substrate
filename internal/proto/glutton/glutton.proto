@@ -66,6 +66,13 @@ service Glutton {
   // load; calling again replaces it, and num_cores=0 stops it. See
   // UseCPURequest for the (goroutines x duty cycle) shape.
   rpc UseCPU(UseCPURequest) returns (UseCPUResponse) {}
+
+  // Runs a list of ops in order inside the glutton, as one request, so a
+  // caller can act out a whole on-sandbox activity (a build, a test run, a
+  // file churn) without a network round trip per op. The request holds the
+  // connection open until the script finishes; op results are discarded,
+  // only timings come back. See RunScriptRequest for the loop option.
+  rpc RunScript(RunScriptRequest) returns (RunScriptResponse) {}
 }
 
 enum WriteMode {
@@ -243,4 +250,48 @@ message UseCPUResponse {
   // The number of goroutines actually spun. Equals the request's
   // num_cores unless it was capped at GOMAXPROCS.
   int32 num_cores = 1;
+}
+
+// ScriptOp is one step of a RunScript: any of the service's unary requests
+// that complete on their own, plus sleep. Gossip and Ping are left out: the
+// first starts a background loop, the second does nothing in-process.
+message ScriptOp {
+  oneof op {
+    WriteRAMRequest write_ram = 1;
+    ReadRAMRequest read_ram = 2;
+    WriteDiskRequest write_disk = 3;
+    ReadDiskRequest read_disk = 4;
+    BurnCPURequest burn_cpu = 5;
+    UseCPURequest use_cpu = 6;
+    IngestRequest ingest = 7;
+    OpenFDRequest open_fd = 8;
+    SleepRequest sleep = 9;
+  }
+}
+
+message SleepRequest {
+  // Wall-clock time to idle, in milliseconds. The glutton stays awake and
+  // does nothing, which paces the ops around it.
+  int64 duration_ms = 1;
+}
+
+message RunScriptRequest {
+  // The ops to run, in order. At least one is required.
+  repeated ScriptOp ops = 1;
+
+  // When positive, the op list is run pass after pass until this much
+  // wall-clock time has elapsed, checked before each op, so the script ends
+  // within one op's duration of the budget. Zero runs the list once.
+  int64 loop_duration_ms = 2;
+}
+
+message RunScriptResponse {
+  // Wall-clock time the whole script took, in milliseconds.
+  int64 elapsed_ms = 1;
+
+  // Passes over the op list that were started; 1 without a loop.
+  int64 passes = 2;
+
+  // Ops run across every pass.
+  int64 ops_run = 3;
 }
