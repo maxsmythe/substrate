@@ -37,6 +37,7 @@ import (
 
 	// Register user classes via init():
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/agentsession"
+	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/agentwalk"
 	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/glutton"
 	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/sweperf"
 )

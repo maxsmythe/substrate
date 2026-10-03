@@ -295,6 +295,102 @@ To go back to a built-in variant, redeploy without the flag.
 * `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane
   lifecycle latencies.
 
+### Agent-Walk Benchmark
+
+The agent-walk benchmark (`--user-class agentwalk`) emulates a fleet of
+personal agents of the Open Claw / Hermes kind. Where the agent-session
+benchmark replays one fixed script, no two of these agents, and no two
+sessions of one agent, do the same work: each locust user is one agent
+driven by a **random walk**, so the fleet's load is a distribution rather
+than a single shape, and the knobs below move that distribution as the
+picture of a realistic workload sharpens.
+
+Each agent owns one actor from the `glutton` template and keeps an internal
+cron. At every tick (default every 30 minutes, with a per-agent phase so a
+fleet started together spreads out) it wakes its actor through the atenet
+router and takes actions until it picks "done":
+
+| Action | Default weight | What happens to the actor |
+|---|---|---|
+| LLM query | 50 | suspended for a log-normal think time (median ~7.7s, p90 ~23.4s, from [SWE-perf](https://github.com/gke-demos/sweperf)), then woken |
+| short compute | 30 | one `RunScript`: a single-goroutine CPU burn of ~6s ±50%; no suspend |
+| long operation | 10 | one `RunScript` of ~60s ±50%: a two-goroutine CPU burn, or a paced rewrite/re-read loop over a 16Mi scratch file, or a re-randomize/walk loop over a 32Mi RAM array, each as likely; no suspend |
+| done | 10 | suspended until the next tick; the session's wall time and action count go to the `Session` row |
+
+Two rules shape the walk: done is never the first action, and never comes
+before an LLM query, so every session is at least one LLM round trip. A
+session is wound up after `--agentwalk-max-actions` regardless (with one
+LLM query first if none has happened). A tick that falls while a session is
+running is skipped: the next tick is always the first one strictly ahead of
+the moment the session ends. While awake the actor burns a small idle load
+(0.25 of a core by default, the figure measured for Open Claw) through
+glutton's `UseCPU`, set once per actor; the goroutine lives in the glutton
+process, so it rides along through suspend and resume.
+
+The on-sandbox work goes through glutton's `RunScript` RPC: the driver
+sends the whole activity as one script and glutton runs it in-process, so
+the actor is held awake for exactly the activity's length and the router
+sees one long request rather than many short ones. A script is a tree: a
+block runs its steps in order and can cycle them for a wall-clock budget,
+and an operation runs its requests (burn CPU, write or read disk or RAM,
+ingest, sleep) at the same time. The response mirrors the tree with summed
+stats, so the compute rows report the requests the sandbox got through.
+The requests are bounded by their planned length plus 30s of slack, well
+under the router's 5-minute route timeout.
+
+```sh
+./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor
+./benchmarking/locust/deploy.sh --deploy --user-class agentwalk
+```
+
+The default working set (a 32Mi RAM array plus a 16Mi tmpfs file) fits the
+256Mi default actor; raise `--actor-memory` if you raise either size.
+
+#### Agent-Walk Configuration Knobs
+
+All are live: an agent re-reads them before each action, so a change takes
+effect across the fleet without a new swarm.
+
+* `--agentwalk-cron-interval` — seconds between an agent's ticks (default
+  1800). A dormant agent notices a change within 10s.
+* `--agentwalk-idle-cpu` — fraction of one core an awake agent burns while
+  idle; 0 disables (default 0.25). Applied once per actor, at creation.
+* `--agentwalk-weight-llm`, `--agentwalk-weight-short`,
+  `--agentwalk-weight-long`, `--agentwalk-weight-done` — the action weights
+  (defaults 50/30/10/10). Only their proportions matter; a zero weight
+  disables that action, and they cannot all be zero.
+* `--agentwalk-think-mu`, `--agentwalk-think-sigma` — log-space moments of
+  the log-normal think time in seconds (defaults 2.0414 / 0.8674).
+* `--agentwalk-short-seconds`, `--agentwalk-long-seconds` — mean lengths of
+  a short burst and a long operation (defaults 6 / 60); each draw is
+  uniform within ±50% of the mean.
+* `--agentwalk-ram-size`, `--agentwalk-disk-size` — the RAM array and
+  scratch file the long operations churn, as Kubernetes quantities
+  (defaults 32Mi / 16Mi).
+* `--agentwalk-max-actions` — session cap (default 50).
+* `--agentwalk-template` — ActorTemplate in `benchmark-workloads` to create
+  agents from (default `glutton`); applies to agents created after a change.
+* `--resume-mode implicit|explicit` and `--lifecycle-mode suspend|pause` —
+  as for the agent-session benchmark.
+
+#### Agent-Walk Reported Metrics
+
+* `WakeFirstTouch`: latency of the ping that wakes the actor, at a tick and
+  after each LLM think — in implicit mode this is the parked wake latency.
+* `LLMThink`: the think times drawn, so the distribution the fleet ran with
+  can be read off the stats.
+* `ComputeShort`, `ComputeLong_cpu`, `ComputeLong_disk`, `ComputeLong_ram`:
+  wall time of each `RunScript`; the response size column is the number of
+  requests glutton ran. A CPU burn is fixed wall-clock, so contention shows
+  up in the disk and RAM rows' request counts dropping rather than in
+  latency.
+* `Session`: wall time from tick wake to done; the response size column is
+  the session's action count. A session cut short by a failure is a failure
+  row carrying the cause.
+* `SetIdleCPU`: the once-per-actor `UseCPU` call.
+* `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane
+  lifecycle latencies.
+
 ### Spawn Benchmark
 
 The Spawn benchmark creates a batch of actors once and measures how long each
