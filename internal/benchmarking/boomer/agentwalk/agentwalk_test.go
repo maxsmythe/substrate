@@ -16,11 +16,13 @@ package agentwalk
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"net/http"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,36 +65,46 @@ func onlyWeights(llm, short, long, done float64) func(k *walkKnobs) {
 func TestResolveDefaults(t *testing.T) {
 	knobs := resolve(walkCodec.Defaults)
 	want := params{
-		cronInterval: 30 * time.Minute,
-		idleCPU:      0.25,
-		weights:      [numActions]float64{50, 30, 10, 10},
-		thinkMu:      2.0414,
-		thinkSigma:   0.8674,
-		shortMean:    6 * time.Second,
-		longMean:     time.Minute,
-		ramSize:      32 << 20,
-		diskSize:     16 << 20,
-		maxActions:   50,
-		template:     "glutton",
+		cronInterval:  30 * time.Minute,
+		idleCPU:       0.25,
+		weights:       [numActions]float64{50, 30, 10, 10},
+		thinkMu:       2.0414,
+		thinkSigma:    0.8674,
+		shortMean:     6 * time.Second,
+		longMean:      time.Minute,
+		shortMaxCores: 1,
+		longMaxCores:  2,
+		longMaxDisk:   16 << 20,
+		longMaxRAM:    32 << 20,
+		longCycle:     2 * time.Second,
+		longJitter:    0.2,
+		maxActions:    50,
+		template:      "glutton",
 	}
 	if knobs != want {
 		t.Errorf("resolve(defaults) =\n %+v, want\n %+v", knobs, want)
+	}
+	if got := knobs.memoryFloor(); got != (32<<20)+(16<<20)+sandboxOverhead {
+		t.Errorf("memoryFloor = %d, want ceilings plus overhead", got)
 	}
 
 	knobs = resolve(testKnobs(func(k *walkKnobs) {
 		k.CronInterval = dynconfig.Seconds(5 * time.Minute)
 		k.IdleCPU = 0.1
-		k.RAMSize = "1Gi"
-		k.DiskSize = "4Ki"
+		k.LongMaxRAM = "1Gi"
+		k.LongMaxDisk = "4Ki"
+		k.LongMaxCores = 8
+		k.LongCycleSeconds = dynconfig.Seconds(500 * time.Millisecond)
 		k.Template = "glutton-big"
 	}))
-	if knobs.cronInterval != 5*time.Minute || knobs.idleCPU != 0.1 || knobs.ramSize != 1<<30 || knobs.diskSize != 4096 || knobs.template != "glutton-big" {
+	if knobs.cronInterval != 5*time.Minute || knobs.idleCPU != 0.1 || knobs.longMaxRAM != 1<<30 || knobs.longMaxDisk != 4096 || knobs.longMaxCores != 8 || knobs.longCycle != 500*time.Millisecond || knobs.template != "glutton-big" {
 		t.Errorf("set knobs did not carry: %+v", knobs)
 	}
-	// A holder built without validation can carry a zero interval; the
-	// tick arithmetic must not divide by it.
-	if knobs := resolve(testKnobs(func(k *walkKnobs) { k.CronInterval = 0 })); knobs.cronInterval != 30*time.Minute {
-		t.Errorf("zero interval resolved to %v, want the default", knobs.cronInterval)
+	// A holder built without validation can carry zeros; the arithmetic
+	// that would divide by them falls back to the defaults.
+	zeros := resolve(testKnobs(func(k *walkKnobs) { k.CronInterval = 0; k.LongCycleSeconds = 0 }))
+	if zeros.cronInterval != 30*time.Minute || zeros.longCycle != 2*time.Second {
+		t.Errorf("zero interval and cycle resolved to %v and %v, want the defaults", zeros.cronInterval, zeros.longCycle)
 	}
 }
 
@@ -110,8 +122,12 @@ func TestValidateKnobs(t *testing.T) {
 		"zero think sigma":   func(k *walkKnobs) { k.ThinkSigma = 0 },
 		"zero short seconds": func(k *walkKnobs) { k.ShortSeconds = 0 },
 		"negative long":      func(k *walkKnobs) { k.LongSeconds = -1 },
-		"unparseable ram":    func(k *walkKnobs) { k.RAMSize = "lots" },
-		"zero disk":          func(k *walkKnobs) { k.DiskSize = "0" },
+		"unparseable ram":    func(k *walkKnobs) { k.LongMaxRAM = "lots" },
+		"zero disk":          func(k *walkKnobs) { k.LongMaxDisk = "0" },
+		"zero short cores":   func(k *walkKnobs) { k.ShortMaxCores = 0 },
+		"zero long cores":    func(k *walkKnobs) { k.LongMaxCores = 0 },
+		"zero cycle":         func(k *walkKnobs) { k.LongCycleSeconds = 0 },
+		"jitter of one":      func(k *walkKnobs) { k.LongJitter = 1 },
 		"zero max actions":   func(k *walkKnobs) { k.MaxActions = 0 },
 		"empty template":     func(k *walkKnobs) { k.Template = "" },
 		"bad resume mode":    func(k *walkKnobs) { k.ResumeMode = "sometimes" },
@@ -208,59 +224,220 @@ func TestDurationSpread(t *testing.T) {
 	}
 }
 
-// Each script is the tree RunScript expects for its activity: a single
-// burn for CPU, a block that cycles write, read, pause for the duration
-// for disk and RAM, sized by the knobs.
-func TestScripts(t *testing.T) {
-	knobs := resolve(testKnobs(func(k *walkKnobs) { k.RAMSize, k.DiskSize = "8Mi", "2Mi" }))
-
-	// request is the single request of step i of the script's root block.
-	request := func(req *gluttonpb.RunScriptRequest, i int) *gluttonpb.Request {
-		t.Helper()
-		steps := req.GetScript().GetSteps()
-		if i >= len(steps) || len(steps[i].GetOperation().GetRequests()) != 1 {
-			t.Fatalf("script step %d is not a single-request operation: %v", i, req)
-		}
-		return steps[i].GetOperation().GetRequests()[0]
-	}
-
-	short := shortScript(6 * time.Second)
-	if short.GetScript().GetLoopDurationMs() != 0 || len(short.GetScript().GetSteps()) != 1 {
+// A short burst is one burn, with its goroutines drawn up to the ceiling.
+func TestShortScript(t *testing.T) {
+	short := shortScript(6*time.Second, 3)
+	steps := short.GetScript().GetSteps()
+	if short.GetScript().GetLoopDurationMs() != 0 || len(steps) != 1 {
 		t.Fatalf("short script = %v, want one step and no loop", short)
 	}
-	if burn := request(short, 0).GetBurnCpu(); burn.GetDurationMs() != 6000 || burn.GetParallelism() != 1 {
-		t.Errorf("short burn = %v, want 6000ms x1", burn)
+	burn := steps[0].GetOperation().GetRequests()[0].GetBurnCpu()
+	if burn.GetDurationMs() != 6000 || burn.GetParallelism() != 3 {
+		t.Errorf("short burn = %v, want 6000ms x3", burn)
 	}
+	rng := testRand()
+	knobs := resolve(testKnobs(func(k *walkKnobs) { k.ShortMaxCores = 4 }))
+	seen := map[int32]bool{}
+	for i := 0; i < 200; i++ {
+		cores := knobs.shortCores(rng)
+		if cores < 1 || cores > 4 {
+			t.Fatalf("shortCores = %d, outside [1, 4]", cores)
+		}
+		seen[cores] = true
+	}
+	if len(seen) != 4 {
+		t.Errorf("shortCores drew %v, want every value in [1, 4]", seen)
+	}
+}
 
-	cpu := knobs.longScript(longCPU, time.Minute)
-	if burn := request(cpu, 0).GetBurnCpu(); cpu.GetScript().GetLoopDurationMs() != 0 || burn.GetDurationMs() != 60000 || burn.GetParallelism() != longCPUParallelism {
-		t.Errorf("long cpu script = %v, want one 60000ms x%d burn", cpu, longCPUParallelism)
+// A mix's shares sum to one and cover the simplex: over many draws every
+// part is sometimes nearly all of the cycle and sometimes nearly none.
+func TestDrawLongMix(t *testing.T) {
+	rng := testRand()
+	knobs := resolve(testKnobs(func(k *walkKnobs) { k.LongMaxCores = 3 }))
+	var lo, hi [numParts]float64
+	for i := range lo {
+		lo[i] = 1
 	}
+	coresSeen := map[int32]bool{}
+	for i := 0; i < 5000; i++ {
+		mix := knobs.drawLongMix(rng)
+		var total float64
+		for part, share := range mix.shares {
+			if share < 0 {
+				t.Fatalf("negative share %v", mix.shares)
+			}
+			total += share
+			lo[part] = min(lo[part], share)
+			hi[part] = max(hi[part], share)
+		}
+		if math.Abs(total-1) > 1e-9 {
+			t.Fatalf("shares %v sum to %v", mix.shares, total)
+		}
+		if mix.cores < 1 || mix.cores > 3 {
+			t.Fatalf("cores = %d, outside [1, 3]", mix.cores)
+		}
+		coresSeen[mix.cores] = true
+	}
+	for part := cyclePart(0); part < numParts; part++ {
+		if lo[part] > 0.02 || hi[part] < 0.8 {
+			t.Errorf("%s share ranged [%.3f, %.3f] over 5000 draws; want the corners covered", part, lo[part], hi[part])
+		}
+	}
+	if len(coresSeen) != 3 {
+		t.Errorf("cores drew %v, want every value in [1, 3]", coresSeen)
+	}
+}
 
-	disk := knobs.longScript(longDisk, time.Minute)
-	if disk.GetScript().GetLoopDurationMs() != 60000 || len(disk.GetScript().GetSteps()) != 3 {
-		t.Fatalf("long disk script = %v, want a 60000ms loop of 3 steps", disk)
+// A long operation's script brings the working set to the ceiling, then
+// loops over jittered cycles until its length is up; each cycle is a block
+// of the concurrent work followed by the idle sleep, sized by the mix.
+func TestLongScript(t *testing.T) {
+	knobs := resolve(testKnobs(func(k *walkKnobs) {
+		k.LongMaxRAM, k.LongMaxDisk = "8Mi", "2Mi"
+		k.LongCycleSeconds = dynconfig.Seconds(time.Second)
+		k.LongJitter = 0.25
+	}))
+	mix := longMix{shares: [numParts]float64{0.4, 0.3, 0.2, 0.1}, cores: 2}
+	req := knobs.longScript(mix, 30*time.Second, testRand())
+	root := req.GetScript()
+	if root.GetLoopDurationMs() != 0 || len(root.GetSteps()) != 2 {
+		t.Fatalf("root = %v, want two unlooped steps", root)
 	}
-	if write := request(disk, 0).GetWriteDisk(); write.GetKey() != diskKey || write.GetSize() != 2<<20 {
-		t.Errorf("disk write = %v, want %s of 2Mi", write, diskKey)
+	if ws := root.GetSteps()[0].GetOperation().GetRequests()[0].GetWriteRam(); ws.GetKey() != ramKey || ws.GetSize() != "8388608" || ws.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE {
+		t.Errorf("working-set step = %v, want an OVERWRITE of 8Mi at %s", ws, ramKey)
 	}
-	if rd := request(disk, 1).GetReadDisk(); rd.GetKey() != diskKey || rd.GetReadMode() != gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY {
-		t.Errorf("disk read = %v, want a digest-only read of %s", rd, diskKey)
+	loop := root.GetSteps()[1].GetBlock()
+	if loop.GetLoopDurationMs() != 30000 || len(loop.GetSteps()) != maxCycleVariants {
+		t.Fatalf("loop = budget %d with %d cycles, want 30000 and %d", loop.GetLoopDurationMs(), len(loop.GetSteps()), maxCycleVariants)
 	}
-	if pause := request(disk, 2).GetSleep(); pause.GetDurationMs() != loopPause.Milliseconds() {
-		t.Errorf("disk pause = %v, want %v", pause, loopPause)
+	within := func(got, nominal float64) bool { return got >= nominal*0.75-1 && got <= nominal*1.25+1 }
+	distinct := map[int64]bool{}
+	for i, step := range loop.GetSteps() {
+		cycle := step.GetBlock()
+		if cycle.GetLoopDurationMs() != 0 || len(cycle.GetSteps()) != 2 {
+			t.Fatalf("cycle %d = %v, want an unlooped block of work then sleep", i, cycle)
+		}
+		work := cycle.GetSteps()[0].GetOperation().GetRequests()
+		if len(work) != 5 {
+			t.Fatalf("cycle %d work has %d requests, want burn, disk write, disk read, ram churn, ram walk", i, len(work))
+		}
+		burn := work[0].GetBurnCpu()
+		if burn.GetParallelism() != 2 || !within(float64(burn.GetDurationMs()), 400) {
+			t.Errorf("cycle %d burn = %v, want 2 goroutines for ~400ms", i, burn)
+		}
+		distinct[burn.GetDurationMs()] = true
+		if write := work[1].GetWriteDisk(); write.GetKey() != diskKey || !within(float64(write.GetSize()), 0.3*(2<<20)) {
+			t.Errorf("cycle %d disk write = %v, want ~30%% of 2Mi", i, write)
+		}
+		if read := work[2].GetReadDisk(); read.GetKey() != diskKey || read.GetReadMode() != gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY {
+			t.Errorf("cycle %d disk read = %v", i, read)
+		}
+		if churn := work[3].GetWriteRam(); churn.GetKey() != ramKey || churn.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+			t.Errorf("cycle %d ram churn = %v, want a rotate of %s", i, churn, ramKey)
+		}
+		if walk := work[4].GetReadRam(); walk.GetKey() != ramKey || walk.GetSize() != work[3].GetWriteRam().GetSize() {
+			t.Errorf("cycle %d ram walk = %v, want the churned bytes walked", i, walk)
+		}
+		if sleep := cycle.GetSteps()[1].GetOperation().GetRequests()[0].GetSleep(); !within(float64(sleep.GetDurationMs()), 100) {
+			t.Errorf("cycle %d sleep = %v, want ~100ms", i, sleep)
+		}
 	}
+	if len(distinct) < 2 {
+		t.Error("every cycle drew the same burn; the jitter is not applied per cycle")
+	}
+	// A short operation spells out fewer cycles, never zero.
+	if got := len(knobs.longScript(mix, 1500*time.Millisecond, testRand()).GetScript().GetSteps()[1].GetBlock().GetSteps()); got != 1 {
+		t.Errorf("a 1.5s operation at a 1s cycle spelled out %d cycles, want 1", got)
+	}
+	// Tiny shares still move something.
+	tiny := knobs.longScript(longMix{shares: [numParts]float64{0.9998, 0.0001, 0.0001, 0}, cores: 1}, 5*time.Second, testRand())
+	work := tiny.GetScript().GetSteps()[1].GetBlock().GetSteps()[0].GetBlock().GetSteps()[0].GetOperation().GetRequests()
+	if work[1].GetWriteDisk().GetSize() < minIOBytes || work[3].GetWriteRam().GetSize() != fmt.Sprint(minIOBytes) {
+		t.Errorf("tiny shares produced disk %d and ram %s, want the %d floor", work[1].GetWriteDisk().GetSize(), work[3].GetWriteRam().GetSize(), minIOBytes)
+	}
+}
 
-	ram := knobs.longScript(longRAM, 30*time.Second)
-	if ram.GetScript().GetLoopDurationMs() != 30000 || len(ram.GetScript().GetSteps()) != 3 {
-		t.Fatalf("long ram script = %v, want a 30000ms loop of 3 steps", ram)
+// measure turns a result tree into per-leaf rates: bytes over the leaf's
+// own elapsed, iterations per goroutine-second, slept over asked, and a
+// cycle's elapsed per pass over its nominal length.
+func TestMeasure(t *testing.T) {
+	stats := func(elapsedMs, passes int64, edit func(s *gluttonpb.Stats)) *gluttonpb.StepResult {
+		s := &gluttonpb.Stats{ElapsedMs: elapsedMs, Passes: passes}
+		if edit != nil {
+			edit(s)
+		}
+		return &gluttonpb.StepResult{Stats: s}
 	}
-	if write := request(ram, 0).GetWriteRam(); write.GetKey() != ramKey || write.GetSize() != "8388608" || write.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE {
-		t.Errorf("ram write = %v, want an OVERWRITE of 8Mi at %s", write, ramKey)
+	knobs := resolve(testKnobs(func(k *walkKnobs) { k.LongCycleSeconds = dynconfig.Seconds(time.Second) }))
+	mix := longMix{shares: [numParts]float64{0.5, 0.2, 0.2, 0.1}, cores: 2}
+	req := knobs.longScript(mix, 2*time.Second, testRand()) // two cycles spelled out
+	leaf := func(kind string, elapsed, passes int64) *gluttonpb.StepResult {
+		return stats(elapsed, passes, func(s *gluttonpb.Stats) {
+			switch kind {
+			// Sums over the five passes, as the glutton reports them.
+			case "burn":
+				s.BurnIterations = 4000 // 2 goroutines over 5s: 400 per core-second
+			case "write":
+				s.DiskBytesWritten = 20 << 20 // 20 MiB in 2.5s: 8 MiB/s
+			case "read":
+				s.DiskBytesRead = 10 << 20 // 10 MiB in 2.5s: 4 MiB/s
+			case "churn":
+				s.RamBytesWritten = 80 << 20 // 80 MiB in 2.5s: 32 MiB/s
+			case "walk":
+				s.RamBytesRead = 40 << 20 // 40 MiB in 2.5s: 16 MiB/s
+			case "sleep":
+				s.SleptMs = elapsed
+			}
+		})
 	}
-	if rd := request(ram, 1).GetReadRam(); rd.GetKey() != ramKey {
-		t.Errorf("ram read = %v, want a walk of %s", rd, ramKey)
+	// Both spelled-out cycles ran five passes each; the first cycle's work
+	// took 1s and its sleep slept exactly what it asked; the second's
+	// sleep overslept by half.
+	cycleResult := func(cycleIndex int, oversleep float64) *gluttonpb.StepResult {
+		askedMs := req.GetScript().GetSteps()[1].GetBlock().GetSteps()[cycleIndex].GetBlock().GetSteps()[1].GetOperation().GetRequests()[0].GetSleep().GetDurationMs()
+		slept := int64(float64(askedMs) * 5 * oversleep)
+		work := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 5000, Passes: 5}, Children: []*gluttonpb.StepResult{
+			leaf("burn", 5000, 5), leaf("write", 2500, 5), leaf("read", 2500, 5), leaf("churn", 2500, 5), leaf("walk", 2500, 5),
+		}}
+		sleep := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: slept, Passes: 5}, Children: []*gluttonpb.StepResult{leaf("sleep", slept, 5)}}
+		return &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 5000 + slept, Passes: 5}, Children: []*gluttonpb.StepResult{work, sleep}}
 	}
+	result := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{Passes: 1}, Children: []*gluttonpb.StepResult{
+		{Stats: &gluttonpb.Stats{Passes: 1}, Children: []*gluttonpb.StepResult{stats(0, 1, nil)}}, // working set, fake-like: no elapsed
+		{Stats: &gluttonpb.Stats{Passes: 5}, Children: []*gluttonpb.StepResult{cycleResult(0, 1), cycleResult(1, 1.5)}},
+	}}
+
+	got := measure(req, result, time.Second)
+	approx := func(name string, values []float64, want ...float64) {
+		t.Helper()
+		if len(values) != len(want) {
+			t.Fatalf("%s = %v, want %v", name, values, want)
+		}
+		for i := range want {
+			if math.Abs(values[i]-want[i]) > 0.02*want[i] {
+				t.Errorf("%s = %v, want %v", name, values, want)
+				return
+			}
+		}
+	}
+	approx("burn per core-second", got.burnPerCoreSecond, 400, 400)
+	approx("disk write MiB/s", got.diskWriteMiBps, 8, 8)
+	approx("disk read MiB/s", got.diskReadMiBps, 4, 4)
+	// The working-set leaf had no elapsed and yields nothing; the churns do.
+	approx("ram churn MiB/s", got.ramChurnMiBps, 32, 32)
+	approx("ram walk MiB/s", got.ramWalkMiBps, 16, 16)
+	approx("sleep ratio", got.sleepRatios, 1, 1.5)
+	// Stretch is each cycle's elapsed per pass over the 1s nominal cycle.
+	first := (5000 + float64(result.Children[1].Children[0].Children[1].Stats.ElapsedMs)) / 5 / 1000
+	second := (5000 + float64(result.Children[1].Children[1].Children[1].Stats.ElapsedMs)) / 5 / 1000
+	approx("cycle stretch", got.cycleStretches, first, second)
+	// Without a cycle length there is no stretch, and rates still come out.
+	if again := measure(req, result, 0); len(again.cycleStretches) != 0 || len(again.burnPerCoreSecond) != 2 {
+		t.Errorf("measure without a cycle = %+v", again)
+	}
+	// A result shorter than the script (a cut pass) does not panic.
+	measure(req, &gluttonpb.StepResult{Stats: &gluttonpb.Stats{}}, time.Second)
 }
 
 // Ticks fall at epoch+phase and every interval after; the next one is
@@ -504,6 +681,58 @@ func TestShutdownFansOut(t *testing.T) {
 	}
 }
 
+// startUser refuses a template whose memory limit is below the working
+// set the walk will make resident, and remembers the refusal briefly so a
+// fleet of starting agents does not hammer ateapi.
+func TestStartUserChecksTemplateMemory(t *testing.T) {
+	srv := &fake.Server{}
+	ctl := &fakeControlClient{templateMemory: "128Mi"}
+	ts := srv.Start(t)
+	rt := newRuntime(&userclass.Config{
+		APIStub: ctl, HTTPClient: ts.Client(), RouterURL: ts.URL, Atespace: "benchmark",
+		Dyn:    dynconfig.Static(testKnobs(nil)),
+		Tracer: otel.Tracer("test"),
+	})
+	rt.now, rt.sleep = time.Now, func(time.Duration) {}
+
+	if _, err := rt.startUser(context.Background()); err == nil || !strings.Contains(err.Error(), "below the walk's floor") {
+		t.Fatalf("startUser against a 128Mi template: err = %v, want a floor refusal", err)
+	}
+	if _, err := rt.startUser(context.Background()); err == nil {
+		t.Fatal("second startUser did not reuse the refusal")
+	}
+	if got := countCalls(ctl.recordedCalls(), "GetActorTemplate"); got != 1 {
+		t.Errorf("GetActorTemplate called %d times, want 1 (the refusal is cached)", got)
+	}
+	if got := countCalls(ctl.recordedCalls(), "CreateActor"); got != 0 {
+		t.Errorf("CreateActor called %d times against a refused template", got)
+	}
+
+	ctl.setTemplateMemory("1Gi")
+	rt.templateErrAt = time.Time{} // let the cache expire
+	walker, err := rt.startUser(context.Background())
+	if err != nil {
+		t.Fatalf("startUser against a 1Gi template: %v", err)
+	}
+	if walker == nil || countCalls(ctl.recordedCalls(), "CreateActor") != 1 {
+		t.Errorf("startUser did not create the actor once the template fit: calls = %v", ctl.recordedCalls())
+	}
+	// Success is cached too.
+	if _, err := rt.startUser(context.Background()); err != nil || countCalls(ctl.recordedCalls(), "GetActorTemplate") != 2 {
+		t.Errorf("second successful startUser: err %v, GetActorTemplate calls %d, want 2", err, countCalls(ctl.recordedCalls(), "GetActorTemplate"))
+	}
+}
+
+func countCalls(calls []string, name string) int {
+	n := 0
+	for _, c := range calls {
+		if c == name {
+			n++
+		}
+	}
+	return n
+}
+
 // fakeClock stands in for time in waitForTick: sleep advances it.
 type fakeClock struct {
 	t       time.Time
@@ -553,6 +782,9 @@ type fakeControlClient struct {
 	suspendErrs []error
 	// sawDeadline is set when a call arrived with a context deadline.
 	sawDeadline bool
+	// templateMemory is the memory limit GetActorTemplate reports; "" means
+	// the template sets none.
+	templateMemory string
 	// deleteDelay stalls each DeleteActor; inFlight and maxInFlight count
 	// concurrent DeleteActor calls, to prove shutdown fans out.
 	deleteDelay time.Duration
@@ -576,6 +808,23 @@ func (f *fakeControlClient) record(ctx context.Context, name string) {
 	if _, ok := ctx.Deadline(); ok {
 		f.sawDeadline = true
 	}
+}
+
+func (f *fakeControlClient) setTemplateMemory(limit string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.templateMemory = limit
+}
+
+func (f *fakeControlClient) GetActorTemplate(ctx context.Context, in *ateapipb.GetActorTemplateRequest, opts ...grpc.CallOption) (*ateapipb.ActorTemplate, error) {
+	f.record(ctx, "GetActorTemplate")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tmpl := &ateapipb.ActorTemplate{}
+	if f.templateMemory != "" {
+		tmpl.Resources = &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "memory", Quantity: f.templateMemory}}}
+	}
+	return tmpl, nil
 }
 
 func (f *fakeControlClient) CreateAtespace(ctx context.Context, in *ateapipb.CreateAtespaceRequest, opts ...grpc.CallOption) (*ateapipb.Atespace, error) {

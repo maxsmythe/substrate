@@ -60,6 +60,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
@@ -90,7 +91,7 @@ const (
 	wakeMetric      = "WakeFirstTouch"
 	thinkMetric     = "LLMThink"
 	shortMetric     = "ComputeShort"
-	longMetricStem  = "ComputeLong_"
+	longMetric      = "ComputeLong"
 	sessionMetric   = "Session"
 	idleCPUMetric   = "SetIdleCPU"
 	crashMetric     = "CrashCount"
@@ -134,7 +135,28 @@ type runtime struct {
 	// out think times and cron gaps.
 	now   func() time.Time
 	sleep func(time.Duration)
+
+	// The template memory check is keyed by template and floor. Success is
+	// cached until either changes; a refusal is cached for
+	// templateRecheckInterval so a redeploy with a bigger limit is picked
+	// up without restarting the workers.
+	templateMu    sync.Mutex
+	templateOK    templateCheck
+	templateErr   error
+	templateErrAt time.Time
+	templateFor   templateCheck
 }
+
+// templateCheck identifies one memory check: which template, against what
+// floor.
+type templateCheck struct {
+	template string
+	floor    int64
+}
+
+// templateRecheckInterval is how long a template memory refusal stands
+// before the next startUser asks ateapi again.
+const templateRecheckInterval = 30 * time.Second
 
 func newRuntime(cfg *userclass.Config) *runtime {
 	var transport http.RoundTripper
@@ -183,11 +205,15 @@ func (r *runtime) iterate() {
 // later one, with a wake from suspension. The tick phase is drawn here, so
 // a fleet started together spreads its ticks over the whole interval.
 func (r *runtime) startUser(ctx context.Context) (*agent, error) {
+	knobs := resolve(dynconfig.Get[walkKnobs](r.cfg.Dyn))
+	if err := r.checkTemplateMemory(ctx, templateCheck{template: knobs.template, floor: knobs.memoryFloor()}); err != nil {
+		return nil, err
+	}
 	walker := &agent{
 		rt:        r,
 		cfg:       r.cfg,
 		actorName: "walk-" + uuid.NewString(),
-		template:  resolve(dynconfig.Get[walkKnobs](r.cfg.Dyn)).template,
+		template:  knobs.template,
 		rng:       rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 		epoch:     r.now(),
 	}
@@ -212,6 +238,69 @@ func (r *runtime) startUser(ctx context.Context) (*agent, error) {
 	// A failed park is re-driven at the top of the first step.
 	walker.hibernate(ctx)
 	return walker, nil
+}
+
+// checkTemplateMemory refuses to start agents against a template whose
+// memory limit is below the walk's floor, or whose limit does not parse.
+// The RAM ceiling makes the floor certain rather than worst-case: every
+// actor's working set reaches it after a few long operations and stays,
+// so a too-small actor OOMs at a random later point, which is far harder
+// to read than a refusal at start. A template with no memory limit at all
+// is allowed through with a warning.
+func (r *runtime) checkTemplateMemory(ctx context.Context, check templateCheck) error {
+	r.templateMu.Lock()
+	defer r.templateMu.Unlock()
+	if r.templateOK == check {
+		return nil
+	}
+	if r.templateErr != nil && r.templateFor == check && time.Since(r.templateErrAt) < templateRecheckInterval {
+		return r.templateErr
+	}
+	ref := &ateapipb.ObjectRef{Atespace: templateNS, Name: check.template}
+	tmpl, err := r.cfg.APIStub.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: ref})
+	if err != nil {
+		// Not a verdict: the next startUser asks again.
+		return fmt.Errorf("GetActorTemplate %s/%s: %w", templateNS, check.template, err)
+	}
+	refuse := func(err error) error {
+		r.templateErr, r.templateErrAt, r.templateFor = err, time.Now(), check
+		return err
+	}
+	limit, found, err := memoryLimit(tmpl)
+	switch {
+	case err != nil:
+		return refuse(fmt.Errorf("template %s/%s: %w", templateNS, check.template, err))
+	case !found:
+		slog.Warn("agentwalk: template sets no memory limit; cannot check it against the working set",
+			slog.String("template", check.template),
+			slog.Int64("floor_bytes", check.floor))
+	case limit < check.floor:
+		return refuse(fmt.Errorf("template %s/%s memory limit %d bytes is below the walk's floor of %d bytes (agentwalk_long_max_ram + agentwalk_long_max_disk + %d of sandbox overhead); lower the ceilings or redeploy the workloads with a bigger --actor-memory",
+			templateNS, check.template, limit, check.floor, int64(sandboxOverhead)))
+	}
+	r.templateOK = check
+	r.templateErr = nil
+	return nil
+}
+
+// memoryLimit reads the template's memory limit in bytes. found is false
+// when the template sets none; a limit that does not parse is an error.
+func memoryLimit(tmpl *ateapipb.ActorTemplate) (limit int64, found bool, err error) {
+	for _, l := range tmpl.GetResources().GetLimits() {
+		if l.GetName() != "memory" {
+			continue
+		}
+		quantity, err := resource.ParseQuantity(l.GetQuantity())
+		if err != nil {
+			return 0, true, fmt.Errorf("memory limit %q: %w", l.GetQuantity(), err)
+		}
+		bytes, ok := quantity.AsInt64()
+		if !ok {
+			return 0, true, fmt.Errorf("memory limit %q is not a whole byte count", l.GetQuantity())
+		}
+		return bytes, true, nil
+	}
+	return 0, false, nil
 }
 
 // shutdownConcurrency bounds how many agents suspendAndDelete at once.
@@ -311,11 +400,12 @@ func (u *agent) step(ctx context.Context) {
 		u.queryLLM(ctx, knobs)
 	case actionShort:
 		length := knobs.shortDuration(u.rng)
-		u.compute(ctx, shortMetric, shortScript(length), length)
+		u.compute(ctx, shortMetric, shortScript(length, knobs.shortCores(u.rng)), length, 0)
 	case actionLong:
-		kind := pickLongKind(u.rng)
+		mix := knobs.drawLongMix(u.rng)
 		length := knobs.longDuration(u.rng)
-		u.compute(ctx, longMetricStem+kind.String(), knobs.longScript(kind, length), length)
+		observeMix(mix)
+		u.compute(ctx, longMetric, knobs.longScript(mix, length, u.rng), length, knobs.longCycle)
 	case actionDone:
 		u.endSession(ctx, nil)
 	}
@@ -391,9 +481,11 @@ func (u *agent) queryLLM(ctx context.Context, knobs params) {
 }
 
 // compute runs one RunScript against the actor and reports its wall time
-// under name. The request is bounded by the script's planned length plus
-// slack, on a client with no timeout of its own.
-func (u *agent) compute(ctx context.Context, name string, script *gluttonpb.RunScriptRequest, planned time.Duration) {
+// under name, and the rates of its leaves to the contention histograms;
+// cycle is the nominal cycle length for a long operation's stretch, zero
+// for a script without cycles. The request is bounded by the script's
+// planned length plus slack, on a client with no timeout of its own.
+func (u *agent) compute(ctx context.Context, name string, script *gluttonpb.RunScriptRequest, planned, cycle time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, planned+scriptSlack)
 	defer cancel()
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
@@ -414,6 +506,7 @@ func (u *agent) compute(ctx context.Context, name string, script *gluttonpb.RunS
 		return
 	}
 	u.noteSuccess()
+	measure(script, resp.GetResult(), cycle).observe()
 	bmetrics.RecordSuccess(methodHTTP, name, userClass, latency, resp.GetResult().GetStats().GetRequestsRun())
 }
 

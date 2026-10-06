@@ -128,24 +128,65 @@ def add_agentwalk_arguments(parser: LocustArgumentParser) -> None:
         include_in_web_ui=True,
     )
     parser.add_argument(
-        "--agentwalk-ram-size",
+        "--agentwalk-short-max-cores",
+        type=int,
+        default=1,
+        env_var="LOCUST_AGENTWALK_SHORT_MAX_CORES",
+        help="Ceiling on a short burst's goroutines; each burst draws from 1 to this (default: 1)",
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
+        "--agentwalk-long-max-cores",
+        type=int,
+        default=2,
+        env_var="LOCUST_AGENTWALK_LONG_MAX_CORES",
+        help="Ceiling on a long operation's CPU goroutines; each operation draws from 1 to this (default: 2)",
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
+        "--agentwalk-long-max-disk",
         type=str,
-        default="32Mi",
-        env_var="LOCUST_AGENTWALK_RAM_SIZE",
+        default="16Mi",
+        env_var="LOCUST_AGENTWALK_LONG_MAX_DISK",
         help=(
-            "RAM array a long RAM operation re-randomizes and walks, as a "
-            "Kubernetes quantity (default: 32Mi)"
+            "Ceiling on the bytes a long operation writes and reads back per cycle, "
+            "as a Kubernetes quantity; the operation's disk share scales it. The data "
+            "dir is tmpfs, so this is memory too (default: 16Mi)"
         ),
         include_in_web_ui=True,
     )
     parser.add_argument(
-        "--agentwalk-disk-size",
+        "--agentwalk-long-max-ram",
         type=str,
-        default="16Mi",
-        env_var="LOCUST_AGENTWALK_DISK_SIZE",
+        default="32Mi",
+        env_var="LOCUST_AGENTWALK_LONG_MAX_RAM",
         help=(
-            "File a long disk operation rewrites and re-reads, as a Kubernetes "
-            "quantity; the data dir is tmpfs, so this is memory too (default: 16Mi)"
+            "Ceiling on the bytes a long operation churns and walks per cycle, as a "
+            "Kubernetes quantity, and the resident working set every actor ends up "
+            "holding (default: 32Mi)"
+        ),
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
+        "--agentwalk-long-cycle-seconds",
+        type=float,
+        default=2.0,
+        env_var="LOCUST_AGENTWALK_LONG_CYCLE_SECONDS",
+        help=(
+            "Nominal length of one cycle of a long operation; the CPU and idle shares "
+            "are fractions of it, and the operation repeats cycles until its length is "
+            "up (default: 2)"
+        ),
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
+        "--agentwalk-long-jitter",
+        type=float,
+        default=0.2,
+        env_var="LOCUST_AGENTWALK_LONG_JITTER",
+        help=(
+            "How far each cycle's intensities stray from the operation's draw, as a "
+            "fraction in [0, 1) (default: 0.2)"
         ),
         include_in_web_ui=True,
     )

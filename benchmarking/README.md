@@ -314,7 +314,7 @@ router and takes actions until it picks "done":
 |---|---|---|
 | LLM query | 50 | suspended for a log-normal think time (median ~7.7s, p90 ~23.4s, from [SWE-perf](https://github.com/gke-demos/sweperf)), then woken |
 | short compute | 30 | one `RunScript`: a single-goroutine CPU burn of ~6s ±50%; no suspend |
-| long operation | 10 | one `RunScript` of ~60s ±50%: a two-goroutine CPU burn, or a paced rewrite/re-read loop over a 16Mi scratch file, or a re-randomize/walk loop over a 32Mi RAM array, each as likely; no suspend |
+| long operation | 10 | one `RunScript` of ~60s ±50% with a mix drawn per operation: how the cycle splits between CPU, disk, RAM, and idling, and how hard each part goes, under per-resource ceilings; cycles repeat with per-cycle jitter until the length is up; no suspend |
 | done | 10 | suspended until the next tick; the session's wall time and action count go to the `Session` row |
 
 Two rules shape the walk: done is never the first action, and never comes
@@ -333,10 +333,25 @@ the actor is held awake for exactly the activity's length and the router
 sees one long request rather than many short ones. A script is a tree: a
 block runs its steps in order and can cycle them for a wall-clock budget,
 and an operation runs its requests (burn CPU, write or read disk or RAM,
-ingest, sleep) at the same time. The response mirrors the tree with summed
-stats, so the compute rows report the requests the sandbox got through.
-The requests are bounded by their planned length plus 30s of slack, well
-under the router's 5-minute route timeout.
+ingest, sleep) at the same time. The requests are bounded by their planned
+length plus 30s of slack, well under the router's 5-minute route timeout.
+
+A long operation is generated rather than scripted. When it is picked, the
+agent draws four shares that sum to one, from a flat Dirichlet so the
+corners come up as readily as the middle: the CPU and idle shares are
+fractions of a nominal cycle (`--agentwalk-long-cycle-seconds`), and the
+disk and RAM shares are fractions of the per-cycle byte ceilings. It also
+draws a goroutine count up to `--agentwalk-long-max-cores`. Each cycle
+then runs the CPU burn, a disk write and read of the scratch file, and a
+RAM churn and walk of the working set at the same time, followed by the
+idle sleep, with every intensity jittered independently per cycle by
+`--agentwalk-long-jitter`; the cycle repeats until the operation's length
+is up. One operation is therefore a consistent shape while the fleet's
+operations differ from one another. The first step of every long
+operation brings the RAM working set to `--agentwalk-long-max-ram`, so all
+actors hold the same resident set regardless of their draws; the worker
+refuses to start agents against a template whose memory limit is below
+that working set plus the scratch file plus 128Mi of sandbox overhead.
 
 ```sh
 ./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor
@@ -364,9 +379,18 @@ effect across the fleet without a new swarm.
 * `--agentwalk-short-seconds`, `--agentwalk-long-seconds` — mean lengths of
   a short burst and a long operation (defaults 6 / 60); each draw is
   uniform within ±50% of the mean.
-* `--agentwalk-ram-size`, `--agentwalk-disk-size` — the RAM array and
-  scratch file the long operations churn, as Kubernetes quantities
-  (defaults 32Mi / 16Mi).
+* `--agentwalk-short-max-cores` — ceiling on a short burst's goroutines;
+  each burst draws from 1 to it (default 1).
+* `--agentwalk-long-max-cores`, `--agentwalk-long-max-disk`,
+  `--agentwalk-long-max-ram` — the ceilings a long operation's mix is drawn
+  under: goroutines, and bytes per cycle written and read back, churned and
+  walked, as Kubernetes quantities (defaults 2 / 16Mi / 32Mi). The RAM
+  ceiling is also every actor's resident working set.
+* `--agentwalk-long-cycle-seconds` — nominal cycle length of a long
+  operation (default 2). Size the byte ceilings so an idle sandbox finishes
+  a full-share cycle's I/O within it; the stretch metric is read against it.
+* `--agentwalk-long-jitter` — per-cycle spread of the intensities around the
+  operation's draw, in [0, 1) (default 0.2).
 * `--agentwalk-max-actions` — session cap (default 50).
 * `--agentwalk-template` — ActorTemplate in `benchmark-workloads` to create
   agents from (default `glutton`); applies to agents created after a change.
@@ -379,11 +403,23 @@ effect across the fleet without a new swarm.
   after each LLM think — in implicit mode this is the parked wake latency.
 * `LLMThink`: the think times drawn, so the distribution the fleet ran with
   can be read off the stats.
-* `ComputeShort`, `ComputeLong_cpu`, `ComputeLong_disk`, `ComputeLong_ram`:
-  wall time of each `RunScript`; the response size column is the number of
-  requests glutton ran. A CPU burn is fixed wall-clock, so contention shows
-  up in the disk and RAM rows' request counts dropping rather than in
-  latency.
+* `ComputeShort`, `ComputeLong`: wall time of each `RunScript`; the response
+  size column is the number of requests glutton ran. A burn is fixed
+  wall-clock and the idle sleep pads every cycle, so these rows barely move
+  under contention; the Prometheus histograms below are the signal.
+* `agentwalk_burn_iterations_per_core_second`,
+  `agentwalk_disk_write_mib_per_second`, `agentwalk_disk_read_mib_per_second`,
+  `agentwalk_ram_churn_mib_per_second`, `agentwalk_ram_walk_mib_per_second`:
+  each request's achieved rate, computed from the per-leaf stats the script
+  returns. An idle sandbox gives a known value for each; a contended one
+  falls short, whatever mix the operation drew.
+* `agentwalk_sleep_ratio`: time slept over time asked; above 1 the sandbox
+  is not being scheduled when its timer fires.
+* `agentwalk_cycle_stretch`: a long operation's cycle elapsed over its
+  nominal length. At or under 1 the I/O fit the time the mix left it; above
+  1 the sandbox is behind.
+* `agentwalk_long_share{resource}`: the shares the fleet's long operations
+  were drawn with, so the distribution it ran can be read off.
 * `Session`: wall time from tick wake to done; the response size column is
   the session's action count. A session cut short by a failure is a failure
   row carrying the cause.

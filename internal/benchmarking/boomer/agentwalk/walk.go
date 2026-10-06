@@ -55,10 +55,22 @@ type walkKnobs struct {
 	// its mean.
 	ShortSeconds dynconfig.Seconds `json:"agentwalk_short_seconds"`
 	LongSeconds  dynconfig.Seconds `json:"agentwalk_long_seconds"`
-	// RAMSize is the array a long RAM operation churns and DiskSize the
-	// file a long disk operation rewrites, as Kubernetes quantities.
-	RAMSize  string `json:"agentwalk_ram_size"`
-	DiskSize string `json:"agentwalk_disk_size"`
+	// ShortMaxCores bounds the goroutines of a short burst; each burst
+	// draws from 1 to this.
+	ShortMaxCores int `json:"agentwalk_short_max_cores"`
+	// The ceilings a long operation's mix is drawn under: goroutines for
+	// its CPU part, bytes per cycle for its disk and RAM parts (Kubernetes
+	// quantities). LongMaxRAM is also the resident working set every actor
+	// ends up holding, see memoryFloor.
+	LongMaxCores int    `json:"agentwalk_long_max_cores"`
+	LongMaxDisk  string `json:"agentwalk_long_max_disk"`
+	LongMaxRAM   string `json:"agentwalk_long_max_ram"`
+	// LongCycleSeconds is the nominal length of one cycle of a long
+	// operation; the operation repeats its cycle until its length is up.
+	LongCycleSeconds dynconfig.Seconds `json:"agentwalk_long_cycle_seconds"`
+	// LongJitter is how far each cycle's intensities stray from the
+	// operation's draw, as a fraction in [0, 1).
+	LongJitter float64 `json:"agentwalk_long_jitter"`
 	// MaxActions is the count after which a session is wound up.
 	MaxActions int `json:"agentwalk_max_actions"`
 	// Template is the ActorTemplate in benchmark-workloads each agent is
@@ -68,20 +80,24 @@ type walkKnobs struct {
 
 var walkCodec = dynconfig.Typed[walkKnobs]{
 	Defaults: walkKnobs{
-		CronInterval: dynconfig.Seconds(30 * time.Minute),
-		IdleCPU:      0.25,
-		WeightLLM:    50,
-		WeightShort:  30,
-		WeightLong:   10,
-		WeightDone:   10,
-		ThinkMu:      2.0414,
-		ThinkSigma:   0.8674,
-		ShortSeconds: dynconfig.Seconds(6 * time.Second),
-		LongSeconds:  dynconfig.Seconds(time.Minute),
-		RAMSize:      "32Mi",
-		DiskSize:     "16Mi",
-		MaxActions:   50,
-		Template:     "glutton",
+		CronInterval:     dynconfig.Seconds(30 * time.Minute),
+		IdleCPU:          0.25,
+		WeightLLM:        50,
+		WeightShort:      30,
+		WeightLong:       10,
+		WeightDone:       10,
+		ThinkMu:          2.0414,
+		ThinkSigma:       0.8674,
+		ShortSeconds:     dynconfig.Seconds(6 * time.Second),
+		LongSeconds:      dynconfig.Seconds(time.Minute),
+		ShortMaxCores:    1,
+		LongMaxCores:     2,
+		LongMaxDisk:      "16Mi",
+		LongMaxRAM:       "32Mi",
+		LongCycleSeconds: dynconfig.Seconds(2 * time.Second),
+		LongJitter:       0.2,
+		MaxActions:       50,
+		Template:         "glutton",
 	},
 	Validate: validateKnobs,
 }
@@ -123,15 +139,27 @@ func validateKnobs(k walkKnobs) error {
 	if k.LongSeconds <= 0 {
 		return fmt.Errorf("agentwalk_long_seconds must be positive: %v", k.LongSeconds.Duration())
 	}
-	if _, err := parseSize(k.RAMSize); err != nil {
-		return fmt.Errorf("agentwalk_ram_size: %w", err)
+	if k.ShortMaxCores < 1 {
+		return fmt.Errorf("agentwalk_short_max_cores must be at least 1: %d", k.ShortMaxCores)
 	}
-	diskBytes, err := parseSize(k.DiskSize)
+	if k.LongMaxCores < 1 {
+		return fmt.Errorf("agentwalk_long_max_cores must be at least 1: %d", k.LongMaxCores)
+	}
+	if _, err := parseSize(k.LongMaxRAM); err != nil {
+		return fmt.Errorf("agentwalk_long_max_ram: %w", err)
+	}
+	diskBytes, err := parseSize(k.LongMaxDisk)
 	if err != nil {
-		return fmt.Errorf("agentwalk_disk_size: %w", err)
+		return fmt.Errorf("agentwalk_long_max_disk: %w", err)
 	}
 	if diskBytes > math.MaxInt32 {
-		return fmt.Errorf("agentwalk_disk_size cannot exceed %d (2 GiB), got: %d", math.MaxInt32, diskBytes)
+		return fmt.Errorf("agentwalk_long_max_disk cannot exceed %d (2 GiB), got: %d", math.MaxInt32, diskBytes)
+	}
+	if k.LongCycleSeconds <= 0 {
+		return fmt.Errorf("agentwalk_long_cycle_seconds must be positive: %v", k.LongCycleSeconds.Duration())
+	}
+	if k.LongJitter < 0 || k.LongJitter >= 1 || math.IsNaN(k.LongJitter) {
+		return fmt.Errorf("agentwalk_long_jitter must be in [0, 1), got: %f", k.LongJitter)
 	}
 	if k.MaxActions < 1 {
 		return fmt.Errorf("agentwalk_max_actions must be at least 1: %d", k.MaxActions)
@@ -160,13 +188,21 @@ const (
 	// mean*(1-spread) to mean*(1+spread).
 	durationSpread = 0.5
 
-	// longCPUParallelism is the goroutine count of a long CPU operation; a
-	// build or test run uses more than one core, a short burst does not.
-	longCPUParallelism = 2
+	// maxCycleVariants bounds how many distinct jittered cycles a long
+	// operation's script spells out; the loop runs through them in turn, so
+	// the jitter repeats with this period at most.
+	maxCycleVariants = 16
 
-	// loopPause paces the passes of a disk or RAM loop so the operation is
-	// steady I/O for its whole length rather than one flat-out burst.
-	loopPause = 100 * time.Millisecond
+	// minIOBytes is the least a disk or RAM part moves per cycle, so a
+	// share drawn near zero still issues a real request rather than a
+	// zero-byte one.
+	minIOBytes = 4096
+
+	// sandboxOverhead is the memory a glutton actor needs on top of the
+	// working set a long operation makes resident: the guest, the glutton
+	// process, and allocator transients. Observed around 115Mi for the
+	// agentsession script; rounded up.
+	sandboxOverhead = 128 << 20
 
 	// Sandbox object names the long operations reuse across sessions.
 	ramKey  = "agentwalk_ws"
@@ -206,26 +242,30 @@ func (a action) String() string {
 	return fmt.Sprintf("action(%d)", int(a))
 }
 
-// longKind is the resource a long operation leans on.
-type longKind int
+// cyclePart is one of the four things a long operation's cycle spends
+// its time on. The shares of a mix are indexed by it.
+type cyclePart int
 
 const (
-	longCPU longKind = iota
-	longDisk
-	longRAM
-	numLongKinds
+	resCPU cyclePart = iota
+	resDisk
+	resRAM
+	resIdle
+	numParts
 )
 
-func (k longKind) String() string {
-	switch k {
-	case longCPU:
+func (part cyclePart) String() string {
+	switch part {
+	case resCPU:
 		return "cpu"
-	case longDisk:
+	case resDisk:
 		return "disk"
-	case longRAM:
+	case resRAM:
 		return "ram"
+	case resIdle:
+		return "idle"
 	}
-	return fmt.Sprintf("longKind(%d)", int(k))
+	return fmt.Sprintf("cyclePart(%d)", int(part))
 }
 
 // params is one activation's view of the knobs in the units the walk
@@ -233,17 +273,21 @@ func (k longKind) String() string {
 // quantities. Re-read from dynconfig before every pick, so a knob change
 // applies to the next action of every agent.
 type params struct {
-	cronInterval time.Duration
-	idleCPU      float64
-	weights      [numActions]float64
-	thinkMu      float64
-	thinkSigma   float64
-	shortMean    time.Duration
-	longMean     time.Duration
-	ramSize      int64
-	diskSize     int64
-	maxActions   int
-	template     string
+	cronInterval  time.Duration
+	idleCPU       float64
+	weights       [numActions]float64
+	thinkMu       float64
+	thinkSigma    float64
+	shortMean     time.Duration
+	longMean      time.Duration
+	shortMaxCores int
+	longMaxCores  int
+	longMaxDisk   int64
+	longMaxRAM    int64
+	longCycle     time.Duration
+	longJitter    float64
+	maxActions    int
+	template      string
 }
 
 // resolve converts knobs into params. The holder validated the knobs at
@@ -252,28 +296,43 @@ type params struct {
 // one default, since a zero interval would break the tick arithmetic.
 func resolve(cfg walkKnobs) params {
 	resolved := params{
-		cronInterval: cfg.CronInterval.Duration(),
-		idleCPU:      cfg.IdleCPU,
-		weights:      [numActions]float64{cfg.WeightLLM, cfg.WeightShort, cfg.WeightLong, cfg.WeightDone},
-		thinkMu:      cfg.ThinkMu,
-		thinkSigma:   cfg.ThinkSigma,
-		shortMean:    cfg.ShortSeconds.Duration(),
-		longMean:     cfg.LongSeconds.Duration(),
-		maxActions:   cfg.MaxActions,
-		template:     cfg.Template,
+		cronInterval:  cfg.CronInterval.Duration(),
+		idleCPU:       cfg.IdleCPU,
+		weights:       [numActions]float64{cfg.WeightLLM, cfg.WeightShort, cfg.WeightLong, cfg.WeightDone},
+		thinkMu:       cfg.ThinkMu,
+		thinkSigma:    cfg.ThinkSigma,
+		shortMean:     cfg.ShortSeconds.Duration(),
+		longMean:      cfg.LongSeconds.Duration(),
+		shortMaxCores: max(cfg.ShortMaxCores, 1),
+		longMaxCores:  max(cfg.LongMaxCores, 1),
+		longCycle:     cfg.LongCycleSeconds.Duration(),
+		longJitter:    cfg.LongJitter,
+		maxActions:    cfg.MaxActions,
+		template:      cfg.Template,
 	}
 	if resolved.cronInterval <= 0 {
 		resolved.cronInterval = walkCodec.Defaults.CronInterval.Duration()
 	}
-	resolved.ramSize, _ = parseSize(walkCodec.Defaults.RAMSize)
-	if ramBytes, err := parseSize(cfg.RAMSize); err == nil {
-		resolved.ramSize = ramBytes
+	if resolved.longCycle <= 0 {
+		resolved.longCycle = walkCodec.Defaults.LongCycleSeconds.Duration()
 	}
-	resolved.diskSize, _ = parseSize(walkCodec.Defaults.DiskSize)
-	if diskBytes, err := parseSize(cfg.DiskSize); err == nil && diskBytes <= math.MaxInt32 {
-		resolved.diskSize = diskBytes
+	resolved.longMaxRAM, _ = parseSize(walkCodec.Defaults.LongMaxRAM)
+	if ramBytes, err := parseSize(cfg.LongMaxRAM); err == nil {
+		resolved.longMaxRAM = ramBytes
+	}
+	resolved.longMaxDisk, _ = parseSize(walkCodec.Defaults.LongMaxDisk)
+	if diskBytes, err := parseSize(cfg.LongMaxDisk); err == nil && diskBytes <= math.MaxInt32 {
+		resolved.longMaxDisk = diskBytes
 	}
 	return resolved
+}
+
+// memoryFloor is the least actor memory the walk is known to run under:
+// the working set every actor ends up holding resident (the RAM array is
+// grown to longMaxRAM and never shrinks, and the scratch file is tmpfs)
+// plus the sandbox's own overhead.
+func (p params) memoryFloor() int64 {
+	return p.longMaxRAM + p.longMaxDisk + sandboxOverhead
 }
 
 // walkState is what constrains the next pick: how many actions the session
@@ -347,50 +406,100 @@ func spread(rng *rand.Rand, mean time.Duration) time.Duration {
 	return time.Duration(float64(mean) * factor)
 }
 
-// pickLongKind chooses the resource of a long operation, each as likely as
-// the others.
-func pickLongKind(rng *rand.Rand) longKind {
-	return longKind(rng.IntN(int(numLongKinds)))
+// shortCores draws the goroutines of a short burst, from 1 to the ceiling.
+func (p params) shortCores(rng *rand.Rand) int32 {
+	return int32(1 + rng.IntN(p.shortMaxCores))
 }
 
-// shortScript is a short compute burst: one goroutine spinning for length.
-func shortScript(length time.Duration) *gluttonpb.RunScriptRequest {
-	return script(&gluttonpb.Block{Steps: []*gluttonpb.Step{operation(burnRequest(length, 1))}})
+// shortScript is a short compute burst: cores goroutines spinning for length.
+func shortScript(length time.Duration, cores int32) *gluttonpb.RunScriptRequest {
+	return script(&gluttonpb.Block{Steps: []*gluttonpb.Step{operation(burnRequest(length, cores))}})
 }
 
-// longScript is a long operation of the given kind lasting about length.
-// CPU is one burn across longCPUParallelism goroutines. Disk rewrites and
-// re-reads a scratch file, RAM re-randomizes and walks a working set, each
-// as a block that cycles write, read, pause until length elapses.
-func (p params) longScript(kind longKind, length time.Duration) *gluttonpb.RunScriptRequest {
-	switch kind {
-	case longDisk:
-		return script(&gluttonpb.Block{
-			LoopDurationMs: length.Milliseconds(),
-			Steps: []*gluttonpb.Step{
-				operation(&gluttonpb.Request{Kind: &gluttonpb.Request_WriteDisk{WriteDisk: &gluttonpb.WriteDiskRequest{
-					Key: diskKey, Size: int32(p.diskSize), WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE}}}),
-				operation(&gluttonpb.Request{Kind: &gluttonpb.Request_ReadDisk{ReadDisk: &gluttonpb.ReadDiskRequest{
-					Key: diskKey, ReadMode: gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY}}}),
-				operation(sleepRequest(loopPause)),
-			},
-		})
-	case longRAM:
-		// OVERWRITE grows the array on first touch and re-randomizes it in
-		// place after, so the working set is allocated once per actor and
-		// dirtied on every pass.
-		return script(&gluttonpb.Block{
-			LoopDurationMs: length.Milliseconds(),
-			Steps: []*gluttonpb.Step{
-				operation(&gluttonpb.Request{Kind: &gluttonpb.Request_WriteRam{WriteRam: &gluttonpb.WriteRAMRequest{
-					Key: ramKey, Size: fmt.Sprintf("%d", p.ramSize), WriteMode: gluttonpb.WriteMode_WRITE_MODE_OVERWRITE}}}),
-				operation(&gluttonpb.Request{Kind: &gluttonpb.Request_ReadRam{ReadRam: &gluttonpb.ReadRAMRequest{Key: ramKey}}}),
-				operation(sleepRequest(loopPause)),
-			},
-		})
-	default:
-		return script(&gluttonpb.Block{Steps: []*gluttonpb.Step{operation(burnRequest(length, longCPUParallelism))}})
+// longMix is one long operation's draw: how a cycle is split between CPU,
+// disk, RAM, and idling, and how hard each part goes. Every cycle of the
+// operation follows it, so one operation is a consistent shape while the
+// fleet's operations differ from one another.
+type longMix struct {
+	// shares sum to one. The CPU and idle shares are fractions of the
+	// cycle's time; the disk and RAM shares are fractions of their byte
+	// ceilings per cycle.
+	shares [numParts]float64
+	// cores is the CPU part's goroutine count.
+	cores int32
+}
+
+// drawLongMix draws shares from a flat Dirichlet, by normalizing
+// exponential draws, so the corners (all CPU, all idle) come up as readily
+// as the middle, and cores uniformly up to the ceiling.
+func (p params) drawLongMix(rng *rand.Rand) longMix {
+	var mix longMix
+	var total float64
+	for i := range mix.shares {
+		mix.shares[i] = -math.Log(1 - rng.Float64())
+		total += mix.shares[i]
 	}
+	for i := range mix.shares {
+		mix.shares[i] /= total
+	}
+	mix.cores = int32(1 + rng.IntN(p.longMaxCores))
+	return mix
+}
+
+// longScript is one long operation lasting about length. Its first step
+// brings the actor's RAM working set to the ceiling, so every actor holds
+// the same resident set whatever its draws. Then a block loops over up to
+// maxCycleVariants cycles until length is up. Each cycle is one operation
+// running the CPU burn, a disk write and read, and a RAM churn and walk at
+// the same time, sized by the mix and jittered independently per cycle,
+// followed by the idle sleep. The cycles are spelled out rather than
+// repeated so the jitter varies cycle to cycle.
+func (p params) longScript(mix longMix, length time.Duration, rng *rand.Rand) *gluttonpb.RunScriptRequest {
+	variants := int(length / p.longCycle)
+	variants = max(1, min(variants, maxCycleVariants))
+	cycles := make([]*gluttonpb.Step, 0, variants)
+	for range variants {
+		cycles = append(cycles, p.cycleStep(mix, rng))
+	}
+	return script(&gluttonpb.Block{Steps: []*gluttonpb.Step{
+		operation(writeRAMRequest(p.longMaxRAM, gluttonpb.WriteMode_WRITE_MODE_OVERWRITE)),
+		{Kind: &gluttonpb.Step_Block{Block: &gluttonpb.Block{
+			LoopDurationMs: length.Milliseconds(),
+			Steps:          cycles,
+		}}},
+	}})
+}
+
+// cycleStep is one jittered cycle of a long operation, as a block of the
+// concurrent work followed by the idle sleep, so its result node reports
+// the cycle's own elapsed time.
+func (p params) cycleStep(mix longMix, rng *rand.Rand) *gluttonpb.Step {
+	jitter := func() float64 { return 1 + p.longJitter*(2*rng.Float64()-1) }
+	cycle := float64(p.longCycle)
+	burn := time.Duration(mix.shares[resCPU] * cycle * jitter())
+	idle := time.Duration(mix.shares[resIdle] * cycle * jitter())
+	diskBytes := max(minIOBytes, int64(mix.shares[resDisk]*float64(p.longMaxDisk)*jitter()))
+	ramBytes := max(minIOBytes, int64(mix.shares[resRAM]*float64(p.longMaxRAM)*jitter()))
+	work := operation(
+		burnRequest(burn, mix.cores),
+		&gluttonpb.Request{Kind: &gluttonpb.Request_WriteDisk{WriteDisk: &gluttonpb.WriteDiskRequest{
+			Key: diskKey, Size: int32(min(diskBytes, math.MaxInt32)), WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE}}},
+		&gluttonpb.Request{Kind: &gluttonpb.Request_ReadDisk{ReadDisk: &gluttonpb.ReadDiskRequest{
+			Key: diskKey, ReadMode: gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY}}},
+		// Rotate moves the dirty window through the working set cycle over
+		// cycle instead of re-dirtying the same prefix.
+		writeRAMRequest(ramBytes, gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE),
+		&gluttonpb.Request{Kind: &gluttonpb.Request_ReadRam{ReadRam: &gluttonpb.ReadRAMRequest{
+			Key: ramKey, Size: fmt.Sprintf("%d", ramBytes)}}},
+	)
+	return &gluttonpb.Step{Kind: &gluttonpb.Step_Block{Block: &gluttonpb.Block{
+		Steps: []*gluttonpb.Step{work, operation(sleepRequest(idle))},
+	}}}
+}
+
+func writeRAMRequest(bytes int64, mode gluttonpb.WriteMode) *gluttonpb.Request {
+	return &gluttonpb.Request{Kind: &gluttonpb.Request_WriteRam{WriteRam: &gluttonpb.WriteRAMRequest{
+		Key: ramKey, Size: fmt.Sprintf("%d", bytes), WriteMode: mode}}}
 }
 
 func script(root *gluttonpb.Block) *gluttonpb.RunScriptRequest {
