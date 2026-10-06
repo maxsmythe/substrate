@@ -94,6 +94,7 @@ const (
 	longMetric      = "ComputeLong"
 	sessionMetric   = "Session"
 	idleCPUMetric   = "SetIdleCPU"
+	residentMetric  = "FillResidentRAM"
 	crashMetric     = "CrashCount"
 	methodHTTP      = "http"
 	methodGRPC      = "grpc"
@@ -235,6 +236,7 @@ func (r *runtime) startUser(ctx context.Context) (*agent, error) {
 		return nil, fmt.Errorf("waitServing: %w", err)
 	}
 	walker.ensureIdleCPU(ctx)
+	walker.ensureResidentRAM(ctx)
 	// A failed park is re-driven at the top of the first step.
 	walker.hibernate(ctx)
 	return walker, nil
@@ -355,8 +357,9 @@ type agent struct {
 	actions      int
 	llmCalled    bool
 
-	idleCPUSet bool
-	cleanedUp  bool
+	idleCPUSet  bool
+	residentSet bool
+	cleanedUp   bool
 	// hibernatePending is set by a failed Pause/Suspend: the actor is
 	// stranded RUNNING or SUSPENDING. Waking it from there would misreport
 	// WakeFirstTouch, so step finishes the hibernate first.
@@ -459,6 +462,7 @@ func (u *agent) wake(ctx context.Context) bool {
 	}
 	bmetrics.RecordSuccess(methodHTTP, wakeMetric, userClass, latency, 0)
 	u.ensureIdleCPU(ctx)
+	u.ensureResidentRAM(ctx)
 	return true
 }
 
@@ -555,6 +559,39 @@ func (u *agent) ensureIdleCPU(ctx context.Context) {
 	}
 	u.idleCPUSet = true
 	bmetrics.RecordSuccess(methodHTTP, idleCPUMetric, userClass, latency, 0)
+}
+
+// ensureResidentRAM fills the agent's RAM array to the resident size
+// through glutton WriteRAM: the heap a real agent process holds whether or
+// not it is doing anything. Glutton keeps the allocation across suspend
+// and resume, so every snapshot from the first carries it and the long
+// operations churn within it. Runs once per actor; a failure leaves
+// residentSet unset so the next wake retries.
+func (u *agent) ensureResidentRAM(ctx context.Context) {
+	if u.residentSet {
+		return
+	}
+	resident := resolve(dynconfig.Get[walkKnobs](u.cfg.Dyn)).residentRAM
+	if resident <= 0 {
+		u.residentSet = true
+		return
+	}
+	ctx, span := u.cfg.Tracer.Start(ctx, residentMetric)
+	defer span.End()
+	start := time.Now()
+	// OVERWRITE grows the array on first touch; TRUNCATE would allocate a
+	// second copy before freeing the first and OOM a tightly sized actor.
+	err := u.postProto(ctx, u.cfg.HTTPClient, glutton.WriteRAMRoute,
+		&gluttonpb.WriteRAMRequest{Key: ramKey, Size: fmt.Sprintf("%d", resident), WriteMode: gluttonpb.WriteMode_WRITE_MODE_OVERWRITE},
+		&gluttonpb.WriteRAMResponse{})
+	latency := time.Since(start)
+	boomerutil.LogSampledTrace(span, residentMetric, latency, boomerutil.SourceClient, err)
+	if err != nil {
+		bmetrics.RecordFailure(methodHTTP, residentMetric, userClass, latency, err.Error())
+		return
+	}
+	u.residentSet = true
+	bmetrics.RecordSuccess(methodHTTP, residentMetric, userClass, latency, resident)
 }
 
 // httpError is a router reply with a status of 400 or above. It keeps the

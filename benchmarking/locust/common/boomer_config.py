@@ -84,6 +84,7 @@ _FLAGS = {
     "--actor-deadline": float,
     "--agentwalk-cron-interval": float,
     "--agentwalk-idle-cpu": float,
+    "--agentwalk-resident-ram": str,
     "--agentwalk-weight-llm": float,
     "--agentwalk-weight-short": float,
     "--agentwalk-weight-long": float,

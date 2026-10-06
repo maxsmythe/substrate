@@ -324,8 +324,10 @@ LLM query first if none has happened). A tick that falls while a session is
 running is skipped: the next tick is always the first one strictly ahead of
 the moment the session ends. While awake the actor burns a small idle load
 (0.25 of a core by default, the figure measured for Open Claw) through
-glutton's `UseCPU`, set once per actor; the goroutine lives in the glutton
-process, so it rides along through suspend and resume.
+glutton's `UseCPU`, and holds a resident heap (64Mi by default) filled
+through `WriteRAM`, both set once per actor; they live in the glutton
+process, so they ride along through suspend and resume, and the heap is in
+every snapshot.
 
 The on-sandbox work goes through glutton's `RunScript` RPC: the driver
 sends the whole activity as one script and glutton runs it in-process, so
@@ -347,11 +349,12 @@ RAM churn and walk of the working set at the same time, followed by the
 idle sleep, with every intensity jittered independently per cycle by
 `--agentwalk-long-jitter`; the cycle repeats until the operation's length
 is up. One operation is therefore a consistent shape while the fleet's
-operations differ from one another. The first step of every long
-operation brings the RAM working set to `--agentwalk-long-max-ram`, so all
-actors hold the same resident set regardless of their draws; the worker
-refuses to start agents against a template whose memory limit is below
-that working set plus the scratch file plus 128Mi of sandbox overhead.
+operations differ from one another. Every agent holds
+`--agentwalk-resident-ram` from creation, and the first step of every long
+operation grows that array to `--agentwalk-long-max-ram` if that is larger,
+so all actors hold the same resident set regardless of their draws; the
+worker refuses to start agents against a template whose memory limit is
+below that set plus the scratch file plus 128Mi of sandbox overhead.
 
 ```sh
 ./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor
@@ -370,6 +373,10 @@ effect across the fleet without a new swarm.
   1800). A dormant agent notices a change within 10s.
 * `--agentwalk-idle-cpu` — fraction of one core an awake agent burns while
   idle; 0 disables (default 0.25). Applied once per actor, at creation.
+* `--agentwalk-resident-ram` — memory each agent holds from creation on, as
+  a Kubernetes quantity (default 64Mi): the heap a real agent process keeps
+  whether or not it is busy. Filled once per actor, carried in every
+  snapshot, and churned by the long operations.
 * `--agentwalk-weight-llm`, `--agentwalk-weight-short`,
   `--agentwalk-weight-long`, `--agentwalk-weight-done` — the action weights
   (defaults 50/30/10/10). Only their proportions matter; a zero weight
@@ -423,7 +430,8 @@ effect across the fleet without a new swarm.
 * `Session`: wall time from tick wake to done; the response size column is
   the session's action count. A session cut short by a failure is a failure
   row carrying the cause.
-* `SetIdleCPU`: the once-per-actor `UseCPU` call.
+* `SetIdleCPU`, `FillResidentRAM`: the once-per-actor `UseCPU` and
+  `WriteRAM` calls; the fill's response size column is the bytes filled.
 * `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane
   lifecycle latencies.
 

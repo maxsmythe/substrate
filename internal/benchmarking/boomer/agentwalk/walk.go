@@ -39,6 +39,11 @@ type walkKnobs struct {
 	// IdleCPU is the fraction of one core the agent burns while awake and
 	// idle, in [0, 1]; 0 turns the idle load off.
 	IdleCPU float64 `json:"agentwalk_idle_cpu"`
+	// ResidentRAM is the memory the agent holds from creation on, as a
+	// Kubernetes quantity: the heap a real agent process keeps whether or
+	// not it is doing anything. It is in every snapshot, and the long
+	// operations churn within it.
+	ResidentRAM string `json:"agentwalk_resident_ram"`
 	// The weights of the four actions when an activation picks one. Only
 	// their proportions matter; a zero disables that action, and they
 	// cannot all be zero.
@@ -82,6 +87,7 @@ var walkCodec = dynconfig.Typed[walkKnobs]{
 	Defaults: walkKnobs{
 		CronInterval:     dynconfig.Seconds(30 * time.Minute),
 		IdleCPU:          0.25,
+		ResidentRAM:      "64Mi",
 		WeightLLM:        50,
 		WeightShort:      30,
 		WeightLong:       10,
@@ -111,6 +117,9 @@ func validateKnobs(k walkKnobs) error {
 	}
 	if k.IdleCPU < 0 || k.IdleCPU > 1 {
 		return fmt.Errorf("agentwalk_idle_cpu must be between 0.0 and 1.0, got: %f", k.IdleCPU)
+	}
+	if _, err := parseSize(k.ResidentRAM); err != nil {
+		return fmt.Errorf("agentwalk_resident_ram: %w", err)
 	}
 	var total float64
 	for name, weight := range map[string]float64{
@@ -275,6 +284,7 @@ func (part cyclePart) String() string {
 type params struct {
 	cronInterval  time.Duration
 	idleCPU       float64
+	residentRAM   int64
 	weights       [numActions]float64
 	thinkMu       float64
 	thinkSigma    float64
@@ -316,6 +326,10 @@ func resolve(cfg walkKnobs) params {
 	if resolved.longCycle <= 0 {
 		resolved.longCycle = walkCodec.Defaults.LongCycleSeconds.Duration()
 	}
+	resolved.residentRAM, _ = parseSize(walkCodec.Defaults.ResidentRAM)
+	if residentBytes, err := parseSize(cfg.ResidentRAM); err == nil {
+		resolved.residentRAM = residentBytes
+	}
 	resolved.longMaxRAM, _ = parseSize(walkCodec.Defaults.LongMaxRAM)
 	if ramBytes, err := parseSize(cfg.LongMaxRAM); err == nil {
 		resolved.longMaxRAM = ramBytes
@@ -328,11 +342,11 @@ func resolve(cfg walkKnobs) params {
 }
 
 // memoryFloor is the least actor memory the walk is known to run under:
-// the working set every actor ends up holding resident (the RAM array is
-// grown to longMaxRAM and never shrinks, and the scratch file is tmpfs)
-// plus the sandbox's own overhead.
+// the RAM array every actor holds (filled to residentRAM at creation and
+// grown to longMaxRAM by a long operation if that is larger; it never
+// shrinks), the scratch file (tmpfs), and the sandbox's own overhead.
 func (p params) memoryFloor() int64 {
-	return p.longMaxRAM + p.longMaxDisk + sandboxOverhead
+	return max(p.residentRAM, p.longMaxRAM) + p.longMaxDisk + sandboxOverhead
 }
 
 // walkState is what constrains the next pick: how many actions the session

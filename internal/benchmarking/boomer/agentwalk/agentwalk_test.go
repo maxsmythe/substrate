@@ -67,6 +67,7 @@ func TestResolveDefaults(t *testing.T) {
 	want := params{
 		cronInterval:  30 * time.Minute,
 		idleCPU:       0.25,
+		residentRAM:   64 << 20,
 		weights:       [numActions]float64{50, 30, 10, 10},
 		thinkMu:       2.0414,
 		thinkSigma:    0.8674,
@@ -84,8 +85,13 @@ func TestResolveDefaults(t *testing.T) {
 	if knobs != want {
 		t.Errorf("resolve(defaults) =\n %+v, want\n %+v", knobs, want)
 	}
-	if got := knobs.memoryFloor(); got != (32<<20)+(16<<20)+sandboxOverhead {
-		t.Errorf("memoryFloor = %d, want ceilings plus overhead", got)
+	if got := knobs.memoryFloor(); got != (64<<20)+(16<<20)+sandboxOverhead {
+		t.Errorf("memoryFloor = %d, want the resident set plus the disk ceiling plus overhead", got)
+	}
+	// A long-operation RAM ceiling above the resident set raises the floor,
+	// since the array grows to it.
+	if got := resolve(testKnobs(func(k *walkKnobs) { k.LongMaxRAM = "256Mi" })).memoryFloor(); got != (256<<20)+(16<<20)+sandboxOverhead {
+		t.Errorf("memoryFloor with a 256Mi ceiling = %d, want the ceiling to win", got)
 	}
 
 	knobs = resolve(testKnobs(func(k *walkKnobs) {
@@ -123,6 +129,7 @@ func TestValidateKnobs(t *testing.T) {
 		"zero short seconds": func(k *walkKnobs) { k.ShortSeconds = 0 },
 		"negative long":      func(k *walkKnobs) { k.LongSeconds = -1 },
 		"unparseable ram":    func(k *walkKnobs) { k.LongMaxRAM = "lots" },
+		"zero resident ram":  func(k *walkKnobs) { k.ResidentRAM = "0" },
 		"zero disk":          func(k *walkKnobs) { k.LongMaxDisk = "0" },
 		"zero short cores":   func(k *walkKnobs) { k.ShortMaxCores = 0 },
 		"zero long cores":    func(k *walkKnobs) { k.LongMaxCores = 0 },
@@ -513,6 +520,9 @@ func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 	if cpu := srv.RecordedCPURequests(); len(cpu) != 1 || cpu[0].GetNumCores() != 1 || cpu[0].GetDutyCycle() != 0.25 {
 		t.Errorf("idle CPU requests = %v, want one of 1 core at 0.25", cpu)
 	}
+	if sizes, modes := srv.RecordedRAMWriteSizes(), srv.RecordedRAMWriteModes(); len(sizes) != 1 || sizes[0] != fmt.Sprint(64<<20) || modes[0] != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE {
+		t.Errorf("resident RAM fills = %v %v, want one OVERWRITE of 64Mi", sizes, modes)
+	}
 
 	walker.step(context.Background()) // cap reached, LLM owed: suspend, think, wake
 	if !walker.llmCalled || walker.actions != 2 || !walker.active {
@@ -527,6 +537,7 @@ func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 	wantPaths := []string{
 		glutton.PingRoute,      // tick wake
 		glutton.UseCPURoute,    // idle load, once
+		glutton.WriteRAMRoute,  // resident RAM, once
 		glutton.RunScriptRoute, // short compute
 		glutton.PingRoute,      // wake after the LLM think
 	}

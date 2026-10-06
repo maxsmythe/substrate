@@ -49,6 +49,18 @@ def add_agentwalk_arguments(parser: LocustArgumentParser) -> None:
         include_in_web_ui=True,
     )
     parser.add_argument(
+        "--agentwalk-resident-ram",
+        type=str,
+        default="64Mi",
+        env_var="LOCUST_AGENTWALK_RESIDENT_RAM",
+        help=(
+            "Memory each agent holds from creation on, as a Kubernetes quantity: "
+            "the heap a real agent process keeps whether or not it is busy. In "
+            "every snapshot; the long operations churn within it (default: 64Mi)"
+        ),
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
         "--agentwalk-weight-llm",
         type=float,
         default=50.0,
