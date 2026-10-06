@@ -37,6 +37,7 @@ contract). The flow, with the type hooks marked:
 """
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -63,6 +64,84 @@ MANIFESTS_DIR = "/opt/automation/manifests"
 NAMESPACE = "benchmarking"
 
 TEST_TYPES = tuple(TYPES)
+
+# HACK: the orchestrator runs these instead of the --tests file, so an
+# experiment is a push of this branch: nothing in the CronJob, its
+# ConfigMap, or its flags changes. Same fields as a tests.yaml entry.
+#
+# Sized for the dev cluster at 10 c3-highcpu-4 workers (4 vCPU, 8Gi, about
+# 6Gi allocatable), one worker per node, modeling a fleet of Open Claw
+# agents each serving one ordinary user:
+#
+#   - 40 agents per node, 400 in all. An agent is one actor holding a
+#     192Mi heap from creation, the latent footprint of a real agent
+#     process; a suspended one holds no node memory. With the design's 10%
+#     duty cycle about 4 per node are awake at once, each resident at its
+#     heap plus the guest, roughly 300Mi rather than its 512Mi limit:
+#     about 1.2Gi, 2.5Gi at a peak of eight. Awake agents also burn the
+#     0.25-core idle load measured for Open Claw, so four of them hold a
+#     core before any burst; CPU is the tighter resource on 4 vCPUs.
+#   - The real 30-minute cron, with per-agent phases, so sessions spread
+#     evenly; a 60m run gives each agent two sessions. Short sessions:
+#     with done at 20 a session averages five actions, about three of them
+#     LLM round trips and the rest tool calls, with a long operation in a
+#     bit over one session in four. That is about 25s awake per 30 minutes,
+#     well under the design's 10% estimate; raise the long weight toward 20
+#     to approach it.
+#   - A short action is a tool call of a few seconds; a long one is a
+#     minute of mixed work up to 2 cores, 128Mi of RAM, 64Mi of disk, so
+#     actorMemory must clear 128 + 64 + 128 overhead = 320Mi.
+#   - Disk: a session is about 4 to 5 suspend/resume cycles (one per LLM
+#     round trip, plus the tick wake and the done), so per node roughly
+#     40 agents x 4.5 / 1800s = 0.1 cycles/s, each moving the memory image,
+#     a few hundred MiB with the heap in it, twice (checkpoint and
+#     download): on the order of 65 MiB/s against the 140 MiB/s a 100GB
+#     pd-balanced boot disk gives. Comfortable; raise users to push it,
+#     lower resident_ram to ease it.
+TESTS: list[dict[str, Any]] = [
+    {
+        "name": "ALPHA_agentwalk_everyday",
+        "type": "locust",
+        "description": "agentwalk: 400 Open Claw agents, one ordinary user each, on 10 c3-highcpu-4 nodes",
+        "targetCluster": "dev",
+        "file": "/app/tests/agentwalk.py",
+        "duration": "60m",
+        "users": 400,
+        "workerCount": 10,
+        "actorMemory": "512Mi",
+        # A boomer class holds a goroutine per agent; 500 is light.
+        "runnerCpu": "2",
+        "runnerMemory": "4Gi",
+        "flags": [
+            # The latent footprint of an agent that is awake but not busy.
+            "--agentwalk-idle-cpu",
+            "0.25",
+            "--agentwalk-resident-ram",
+            "192Mi",
+            "--agentwalk-weight-llm",
+            "50",
+            "--agentwalk-weight-short",
+            "25",
+            "--agentwalk-weight-long",
+            "5",
+            "--agentwalk-weight-done",
+            "20",
+            "--agentwalk-short-seconds",
+            "3",
+            "--agentwalk-long-max-ram",
+            "128Mi",
+            "--agentwalk-long-max-disk",
+            "64Mi",
+            # 400 agents ramp in under a minute; the first session of each
+            # starts at its random phase anyway.
+            "--spawn-rate",
+            "10",
+            # Small fleet: trace one request in a hundred.
+            "--trace-probability",
+            "0.01",
+        ],
+    },
+]
 
 # Snapshot the process's initial env so apply_config can return to a known
 # baseline before sourcing the next config (avoids stale vars carrying over
@@ -459,8 +538,9 @@ def main() -> None:
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(f"Building commit {commit}", flush=True)
 
-    tests = yaml.safe_load(Path(args.tests).read_text())["tests"]
-    print(f"Running {len(tests)} test(s)", flush=True)
+    # HACK: see TESTS. The --tests file is left unread.
+    tests = copy.deepcopy(TESTS)
+    print(f"Running {len(tests)} test(s) from the built-in TESTS, ignoring {args.tests}", flush=True)
     try:
         validate_and_normalize_tests(tests)
     except ValueError as e:
