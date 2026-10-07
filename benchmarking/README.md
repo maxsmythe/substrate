@@ -315,7 +315,7 @@ router and takes actions until it picks "done":
 | LLM query | 50 | suspended for a log-normal think time (median ~7.7s, p90 ~23.4s, from [SWE-perf](https://github.com/gke-demos/sweperf)), then woken |
 | short compute | 30 | one `RunScript`: a single-goroutine CPU burn of ~6s ±50%; no suspend |
 | long operation | 10 | one `RunScript` of ~60s ±50% with a mix drawn per operation: how the cycle splits between CPU, disk, RAM, and idling, and how hard each part goes, under per-resource ceilings; cycles repeat with per-cycle jitter until the length is up; no suspend |
-| done | 10 | suspended until the next tick; the session's wall time and action count go to the `Session` row |
+| done | 10 | suspended until the next tick; the session's wall time and action count go to the `SessionLength` row |
 
 Two rules shape the walk: done is never the first action, and never comes
 before an LLM query, so every session is at least one LLM round trip. A
@@ -428,9 +428,12 @@ effect across the fleet without a new swarm.
   1 the sandbox is behind.
 * `agentwalk_long_share{resource}`: the shares the fleet's long operations
   were drawn with, so the distribution it ran can be read off.
-* `Session`: wall time from tick wake to done; the response size column is
-  the session's action count. A session cut short by a failure is a failure
-  row carrying the cause.
+* `SessionLength`: wall time from tick wake to done; the response size
+  column is the session's action count. A session cut short by a failure is
+  a failure row carrying the cause.
+* `DormantLength`: the sleep between sessions, from done to the wake that
+  starts the next one. Normally one cron interval less the session; a tick
+  whose wake failed shows as a double-length gap.
 * `SetIdleCPU`, `FillResidentRAM`: the once-per-actor `UseCPU` and
   `WriteRAM` calls; the fill's response size column is the bytes filled.
 * `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane

@@ -538,6 +538,9 @@ func TestSessionWalksShortThenLLMThenDone(t *testing.T) {
 	if walker.active {
 		t.Fatal("after step 3: still active")
 	}
+	if walker.dormantSince.IsZero() {
+		t.Error("done did not start the dormant clock")
+	}
 
 	wantPaths := []string{
 		glutton.PingRoute,      // tick wake

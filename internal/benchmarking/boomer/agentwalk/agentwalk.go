@@ -92,7 +92,8 @@ const (
 	thinkMetric     = "LLMThink"
 	shortMetric     = "ComputeShort"
 	longMetric      = "ComputeLong"
-	sessionMetric   = "Session"
+	sessionMetric   = "SessionLength"
+	dormantMetric   = "DormantLength"
 	idleCPUMetric   = "SetIdleCPU"
 	residentMetric  = "FillResidentRAM"
 	crashMetric     = "CrashCount"
@@ -352,8 +353,11 @@ type agent struct {
 
 	// Session state. active is set from a successful tick wake until the
 	// session ends; actions and llmCalled constrain the next pick.
+	// dormantSince is when the last session ended, zero before the first,
+	// so the gap to the next wake can be reported.
 	active       bool
 	sessionStart time.Time
+	dormantSince time.Time
 	actions      int
 	llmCalled    bool
 
@@ -389,6 +393,11 @@ func (u *agent) step(ctx context.Context) {
 		}
 		u.active = true
 		u.sessionStart = u.rt.now()
+		if !u.dormantSince.IsZero() {
+			// The sleep between sessions: from done to this wake. A tick
+			// whose wake failed lengthens it, since the agent slept on.
+			bmetrics.RecordSuccess(methodActor, dormantMetric, userClass, u.sessionStart.Sub(u.dormantSince), 0)
+		}
 		u.actions = 0
 		u.llmCalled = false
 	}
@@ -515,20 +524,23 @@ func (u *agent) compute(ctx context.Context, name string, script *gluttonpb.RunS
 }
 
 // endSession parks the actor until the next tick and books the session: a
-// success row whose latency is the session's wall time and whose size is
-// its action count, or a failure row carrying cause. The cause was already
+// SessionLength success row whose latency is the session's wall time and
+// whose size is its action count, or a failure row carrying cause. It
+// also starts the clock on the dormant gap the next wake reports. The cause was already
 // classified where it arose; a failed hibernate here leaves
 // hibernatePending for the next step to re-drive.
 func (u *agent) endSession(ctx context.Context, cause error) {
 	if !u.hibernatePending {
 		u.hibernate(ctx)
 	}
-	elapsed := u.rt.now().Sub(u.sessionStart)
+	now := u.rt.now()
+	elapsed := now.Sub(u.sessionStart)
 	if cause != nil {
 		bmetrics.RecordFailure(methodActor, sessionMetric, userClass, elapsed, cause.Error())
 	} else {
 		bmetrics.RecordSuccess(methodActor, sessionMetric, userClass, elapsed, int64(u.actions))
 	}
+	u.dormantSince = now
 	u.active = false
 }
 
