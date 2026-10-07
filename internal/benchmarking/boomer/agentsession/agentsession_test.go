@@ -845,7 +845,7 @@ func TestDwell(t *testing.T) {
 			HTTPClient: http.DefaultClient,
 			RouterURL:  ts.URL,
 			Atespace:   "benchmark",
-			Dyn:        dynconfig.NewHolder(dynconfig.Config{}),
+			Dyn:        dynconfig.Static(knobs{}),
 		},
 		actorName: "agent-test",
 	}

@@ -62,10 +62,10 @@ func mustApply(t *testing.T, h *Holder, payload string) bool {
 	return changed
 }
 
-// A payload sets the keys it carries, leaves the ones it nulls or omits at
-// their current values, converts seconds to durations, and ignores keys
-// the class does not name.
-func TestApplyMerges(t *testing.T) {
+// A payload stands on its own: it sets the keys it carries, puts the ones
+// it nulls or omits back at the class's defaults, converts seconds to
+// durations, and ignores keys the class does not name.
+func TestApplyDecodesOverDefaults(t *testing.T) {
 	h := NewHolder(knobsCodec)
 	if got := Get[knobs](h); got != knobsCodec.Defaults {
 		t.Fatalf("fresh holder = %+v, want the defaults", got)
@@ -85,16 +85,22 @@ func TestApplyMerges(t *testing.T) {
 	if got := Get[knobs](h); got != want {
 		t.Errorf("after first payload =\n %+v, want\n %+v", got, want)
 	}
+	// A cleared form field comes as null, and a key the master does not
+	// know is absent; both are back at the default, not at the last value.
 	mustApply(t, h, `{"test_template": "big", "test_workers": null, "max_wait_time": null}`)
+	want = knobsCodec.Defaults
 	want.Template = "big"
 	if got := Get[knobs](h); got != want {
-		t.Errorf("after nulls =\n %+v, want\n %+v", got, want)
+		t.Errorf("after nulls and omissions =\n %+v, want\n %+v", got, want)
 	}
 	if changed := mustApply(t, h, `{"test_template": "big"}`); changed {
 		t.Error("a payload that changes nothing reported a change")
 	}
-	if changed := mustApply(t, h, ``); changed {
-		t.Error("an empty payload reported a change")
+	if changed := mustApply(t, h, ``); !changed {
+		t.Error("an empty payload did not report the return to the defaults")
+	}
+	if got := Get[knobs](h); got != knobsCodec.Defaults {
+		t.Errorf("after an empty payload = %+v, want the defaults", got)
 	}
 }
 
@@ -153,6 +159,15 @@ func TestStaticAndNilCodec(t *testing.T) {
 	mustApply(t, h, `{"trace_probability": 0.25, "anything": 1}`)
 	if got := h.Common().TraceProbability; got != 0.25 {
 		t.Errorf("trace_probability = %v, want 0.25", got)
+	}
+}
+
+// A config printed with %+v, as the dynconfig applied log line does, shows
+// its durations as durations, not as counts of nanoseconds.
+func TestSecondsPrintsAsDuration(t *testing.T) {
+	line := fmt.Sprintf("%+v", knobs{WaitTime: WaitTime{MaxWait: Seconds(500 * time.Millisecond)}})
+	if !strings.Contains(line, "MaxWait:500ms") {
+		t.Errorf("printed config %q, want MaxWait:500ms in it", line)
 	}
 }
 

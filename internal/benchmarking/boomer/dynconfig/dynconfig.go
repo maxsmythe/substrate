@@ -23,10 +23,10 @@
 // user class, known at launch, so the class hands the Holder its Codec at
 // construction: the typed struct it reads its knobs from, with the
 // defaults a key left unset falls back to and the rules a fetched value
-// must pass. The Holder then stores that typed value, folds each payload
-// into it, refuses one the class cannot run on in favor of the last good
-// config, and hands the class its config back through Get. Keys the class
-// does not name are ignored.
+// must pass. The Holder then stores that typed value, decodes each payload
+// over those defaults so a payload stands on its own, refuses one the class
+// cannot run on in favor of the last good config, and hands the class its
+// config back through Get. Keys the class does not name are ignored.
 package dynconfig
 
 import (
@@ -46,22 +46,22 @@ import (
 )
 
 // Codec is how a user class's config comes to be: the value a worker
-// starts from, and how a payload folds into the current value. Typed is
-// the implementation a class declares over its knobs struct.
+// starts from, and the value a payload puts in force. Typed is the
+// implementation a class declares over its knobs struct.
 type Codec interface {
 	// Initial is the config before any payload: the class's defaults.
 	Initial() any
-	// Merge folds update, a JSON object, into current and validates the
-	// result. A key absent from update, or null in it, keeps current's
-	// value: the master serves every flag it knows, null for the ones the
-	// operator left blank.
-	Merge(current any, update []byte) (any, error)
+	// Decode is the config payload, a JSON object, puts in force, validated.
+	// Each payload stands on its own: a key absent from it, or null in it,
+	// is at the class's default, not at the value before. The master serves
+	// every flag it knows, null for the ones the operator left blank, so a
+	// field cleared in the form takes the knob back to its default.
+	Decode(payload []byte) (any, error)
 }
 
 // Typed is the Codec over a class's knobs struct T, whose json tags name
-// the keys it reads. Merge decodes the update over a copy of the current
-// value, so untouched keys keep what they had, and runs Validate on the
-// result.
+// the keys it reads. Decode lays the payload over Defaults and runs
+// Validate on the result.
 type Typed[T any] struct {
 	Defaults T
 	Validate func(T) error
@@ -69,13 +69,10 @@ type Typed[T any] struct {
 
 func (c Typed[T]) Initial() any { return c.Defaults }
 
-func (c Typed[T]) Merge(current any, update []byte) (any, error) {
-	next, ok := current.(T)
-	if !ok {
-		return nil, fmt.Errorf("dynconfig: current config is %T, codec expects %T", current, c.Defaults)
-	}
-	if len(bytes.TrimSpace(update)) > 0 {
-		if err := json.Unmarshal(update, &next); err != nil {
+func (c Typed[T]) Decode(payload []byte) (any, error) {
+	next := c.Defaults
+	if len(bytes.TrimSpace(payload)) > 0 {
+		if err := json.Unmarshal(payload, &next); err != nil {
 			return nil, fmt.Errorf("decode config: %w", err)
 		}
 	}
@@ -88,7 +85,7 @@ func (c Typed[T]) Merge(current any, update []byte) (any, error) {
 }
 
 // Common is the slice of the payload the worker itself reads, whatever the
-// user class. Every Holder folds it alongside the class's config.
+// user class. Every Holder decodes it alongside the class's config.
 type Common struct {
 	TraceProbability float64 `json:"trace_probability"`
 }
@@ -130,20 +127,21 @@ func Static[T any](cfg T) *Holder {
 	return NewHolder(Typed[T]{Defaults: cfg})
 }
 
-// Apply folds a payload into the current config. A payload the class's
-// codec or Common refuses leaves the holder as it was and comes back as
-// the error, naming the key. changed is false when the payload left every
-// value as it was, so a caller can keep an unchanged poll out of the log.
-func (h *Holder) Apply(update []byte) (changed bool, err error) {
+// Apply puts a payload in force, decoded over the defaults. A payload the
+// class's codec or Common refuses leaves the holder as it was and comes
+// back as the error, naming the key. changed is false when the payload left
+// every value as it was, so a caller can keep an unchanged poll out of the
+// log.
+func (h *Holder) Apply(payload []byte) (changed bool, err error) {
+	class, err := h.codec.Decode(payload)
+	if err != nil {
+		return false, err
+	}
+	common, err := commonCodec.Decode(payload)
+	if err != nil {
+		return false, err
+	}
 	prev := h.v.Load()
-	class, err := h.codec.Merge(prev.class, update)
-	if err != nil {
-		return false, err
-	}
-	common, err := commonCodec.Merge(prev.common, update)
-	if err != nil {
-		return false, err
-	}
 	next := &state{class: class, common: common.(Common)}
 	if next.common == prev.common && reflect.DeepEqual(next.class, prev.class) {
 		return false, nil
@@ -180,6 +178,10 @@ type Seconds time.Duration
 
 // Duration converts to the time package's unit.
 func (s Seconds) Duration() time.Duration { return time.Duration(s) }
+
+// String prints the duration the way time.Duration does, so a config in a
+// log line reads 500ms rather than a count of nanoseconds.
+func (s Seconds) String() string { return s.Duration().String() }
 
 func (s Seconds) MarshalJSON() ([]byte, error) {
 	return json.Marshal(time.Duration(s).Seconds())
