@@ -17,6 +17,7 @@ package agentwalk
 import (
 	"time"
 
+	bmetrics "github.com/agent-substrate/substrate/internal/benchmarking/boomer/metrics"
 	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -74,8 +75,9 @@ func init() {
 	prometheus.MustRegister(burnRate, diskWriteRate, diskReadRate, ramChurnRate, ramWalkRate, sleepRatio, cycleStretch, longShare)
 }
 
-// rates is what one script's result yields for the histograms, kept apart
-// from the observing so a test can check the arithmetic.
+// rates is what one script's result yields: the rate samples for the
+// histograms and a locust row per leaf, kept apart from the recording so
+// a test can check the arithmetic.
 type rates struct {
 	burnPerCoreSecond []float64
 	diskWriteMiBps    []float64
@@ -84,20 +86,33 @@ type rates struct {
 	ramWalkMiBps      []float64
 	sleepRatios       []float64
 	cycleStretches    []float64
+	rows              []leafRow
+}
+
+// leafRow is one leaf of a script result as a locust row: the request's
+// kind and the action's length make the name (DiskWriteLong, BurnShort),
+// and a looped leaf's sums are spread back over its passes, so latency and
+// length are per request and count is how many of them ran.
+type leafRow struct {
+	name    string
+	latency time.Duration
+	length  int64
+	count   int64
 }
 
 // measure walks a script and its result side by side and computes the
 // rate of every leaf. A node inside a looped block carries sums over its
 // passes, so bytes over elapsed is that leaf's average rate across the
 // operation. cycle is the nominal cycle length for the stretch of each
-// block directly under a looped block; zero skips the stretch.
-func measure(req *gluttonpb.RunScriptRequest, result *gluttonpb.StepResult, cycle time.Duration) rates {
-	var out rates
-	measureBlock(req.GetScript(), result, cycle, false, &out)
+// block directly under a looped block; zero skips the stretch. action is
+// the suffix of the leaf rows' names.
+func measure(req *gluttonpb.RunScriptRequest, result *gluttonpb.StepResult, cycle time.Duration, action string) rates {
+	out := rates{}
+	measureBlock(req.GetScript(), result, cycle, false, action, &out)
 	return out
 }
 
-func measureBlock(block *gluttonpb.Block, result *gluttonpb.StepResult, cycle time.Duration, underLoop bool, out *rates) {
+func measureBlock(block *gluttonpb.Block, result *gluttonpb.StepResult, cycle time.Duration, underLoop bool, action string, out *rates) {
 	if block == nil || result == nil {
 		return
 	}
@@ -112,7 +127,7 @@ func measureBlock(block *gluttonpb.Block, result *gluttonpb.StepResult, cycle ti
 		}
 		switch kind := step.GetKind().(type) {
 		case *gluttonpb.Step_Block:
-			measureBlock(kind.Block, children[i], cycle, block.GetLoopDurationMs() > 0, out)
+			measureBlock(kind.Block, children[i], cycle, block.GetLoopDurationMs() > 0, action, out)
 		case *gluttonpb.Step_Operation:
 			requests := kind.Operation.GetRequests()
 			leaves := children[i].GetChildren()
@@ -120,45 +135,80 @@ func measureBlock(block *gluttonpb.Block, result *gluttonpb.StepResult, cycle ti
 				if j >= len(leaves) {
 					break
 				}
-				measureRequest(request, leaves[j].GetStats(), out)
+				measureRequest(request, leaves[j].GetStats(), action, out)
 			}
 		}
 	}
 }
 
-// measureRequest turns one leaf's stats into its rate. A leaf the fake
-// actor answered, or one cut before it did anything, has no elapsed time
-// and yields nothing.
-func measureRequest(request *gluttonpb.Request, stats *gluttonpb.Stats, out *rates) {
+// measureRequest turns one leaf's stats into its rate sample and its row.
+// A leaf the fake actor answered, or one cut before it did anything, has
+// no elapsed time and yields nothing.
+func measureRequest(request *gluttonpb.Request, stats *gluttonpb.Stats, action string, out *rates) {
 	elapsed := float64(stats.GetElapsedMs()) / 1000
-	if elapsed <= 0 {
+	passes := stats.GetPasses()
+	if elapsed <= 0 || passes <= 0 {
 		return
 	}
 	mibps := func(bytes int64) float64 { return float64(bytes) / (1 << 20) / elapsed }
+	var name string
+	var length int64
 	switch kind := request.GetKind().(type) {
 	case *gluttonpb.Request_BurnCpu:
 		goroutines := max(float64(kind.BurnCpu.GetParallelism()), 1)
 		out.burnPerCoreSecond = append(out.burnPerCoreSecond, float64(stats.GetBurnIterations())/goroutines/elapsed)
-	case *gluttonpb.Request_WriteDisk, *gluttonpb.Request_Ingest:
+		name, length = "Burn", stats.GetBurnIterations()
+	case *gluttonpb.Request_WriteDisk:
 		out.diskWriteMiBps = append(out.diskWriteMiBps, mibps(stats.GetDiskBytesWritten()))
+		name, length = "DiskWrite", stats.GetDiskBytesWritten()
+	case *gluttonpb.Request_Ingest:
+		out.diskWriteMiBps = append(out.diskWriteMiBps, mibps(stats.GetDiskBytesWritten()))
+		name, length = "Ingest", stats.GetDiskBytesWritten()
 	case *gluttonpb.Request_ReadDisk:
 		out.diskReadMiBps = append(out.diskReadMiBps, mibps(stats.GetDiskBytesRead()))
+		name, length = "DiskRead", stats.GetDiskBytesRead()
 	case *gluttonpb.Request_WriteRam:
 		out.ramChurnMiBps = append(out.ramChurnMiBps, mibps(stats.GetRamBytesWritten()))
+		// The one-time fill to the ceiling and the per-cycle rotate are
+		// different work; the mode tells them apart.
+		name, length = "RAMChurn", stats.GetRamBytesWritten()
+		if kind.WriteRam.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+			name = "RAMWrite"
+		}
 	case *gluttonpb.Request_ReadRam:
 		out.ramWalkMiBps = append(out.ramWalkMiBps, mibps(stats.GetRamBytesRead()))
+		name, length = "RAMWalk", stats.GetRamBytesRead()
 	case *gluttonpb.Request_Sleep:
 		// Summed over passes like everything else, so the ratio is the
 		// average; a sleep the budget never let run has no asked time.
-		asked := float64(kind.Sleep.GetDurationMs()) * float64(stats.GetPasses())
+		asked := float64(kind.Sleep.GetDurationMs()) * float64(passes)
 		if asked > 0 {
 			out.sleepRatios = append(out.sleepRatios, float64(stats.GetSleptMs())/asked)
 		}
+		name = "Sleep"
+	default:
+		return
 	}
+	out.rows = append(out.rows, leafRow{
+		name:    name + action,
+		latency: time.Duration(stats.GetElapsedMs()/passes) * time.Millisecond,
+		length:  length / passes,
+		count:   passes,
+	})
 }
 
-// observe records a script's rates.
+// methodScript marks the leaf rows: work the glutton did inside a script,
+// as opposed to a request the driver made.
+const methodScript = "script"
+
+// observe records a script's rates and its leaf rows, one locust
+// observation per request run.
 func (r rates) observe() {
+	for _, row := range r.rows {
+		for range row.count {
+			bmetrics.RecordSuccess(methodScript, row.name, userClass, row.latency, row.length)
+		}
+	}
 	for _, v := range r.burnPerCoreSecond {
 		burnRate.Observe(v)
 	}

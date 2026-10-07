@@ -313,8 +313,8 @@ router and takes actions until it picks "done":
 | Action | Default weight | What happens to the actor |
 |---|---|---|
 | LLM query | 50 | suspended for a log-normal think time (median ~7.7s, p90 ~23.4s, from [SWE-perf](https://github.com/gke-demos/sweperf)), then woken |
-| short compute | 30 | one `RunScript`: a single-goroutine CPU burn of ~6s ±50%; no suspend |
-| long operation | 10 | one `RunScript` of ~60s ±50% with a mix drawn per operation: how the cycle splits between CPU, disk, RAM, and idling, and how hard each part goes, under per-resource ceilings; cycles repeat with per-cycle jitter until the length is up; no suspend |
+| short action | 30 | one `RunScript`: a CPU burn of ~6s ±50%; no suspend |
+| long action | 10 | one `RunScript` of ~60s ±50% with a mix drawn per action: how the cycle splits between CPU, disk, RAM, and idling, and how hard each part goes, under per-resource ceilings; cycles repeat with per-cycle jitter until the length is up; no suspend |
 | done | 10 | suspended until the next tick; the session's wall time and action count go to the `SessionLength` row |
 
 Two rules shape the walk: done is never the first action, and never comes
@@ -411,10 +411,18 @@ effect across the fleet without a new swarm.
   after each LLM think — in implicit mode this is the parked wake latency.
 * `LLMThink`: the think times drawn, so the distribution the fleet ran with
   can be read off the stats.
-* `ComputeShort`, `ComputeLong`: wall time of each `RunScript`; the response
+* `ShortAction`, `LongAction`: wall time of each `RunScript`; the response
   size column is the number of requests glutton ran. A burn is fixed
   wall-clock and the idle sleep pads every cycle, so these rows barely move
-  under contention; the Prometheus histograms below are the signal.
+  under contention; the per-request rows and the Prometheus histograms
+  below are the signal.
+* `BurnShort`, `BurnLong`, `DiskWriteLong`, `DiskReadLong`, `RAMWriteLong`,
+  `RAMChurnLong`, `RAMWalkLong`, `SleepLong`: one row per request kind and
+  action length, built from the per-leaf stats the script returns, with one
+  observation per request run. Latency is the request's own time inside
+  the sandbox; the response size column is its bytes, or iterations for a
+  burn. `RAMWriteLong` is the once-per-action fill of the working set to
+  its ceiling, `RAMChurnLong` the per-cycle rotate within it.
 * `agentwalk_burn_iterations_per_core_second`,
   `agentwalk_disk_write_mib_per_second`, `agentwalk_disk_read_mib_per_second`,
   `agentwalk_ram_churn_mib_per_second`, `agentwalk_ram_walk_mib_per_second`:

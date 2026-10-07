@@ -17,6 +17,7 @@ package agentwalk
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"net/http"
@@ -420,7 +421,7 @@ func TestMeasure(t *testing.T) {
 		{Stats: &gluttonpb.Stats{Passes: 5}, Children: []*gluttonpb.StepResult{cycleResult(0, 1), cycleResult(1, 1.5)}},
 	}}
 
-	got := measure(req, result, time.Second)
+	got := measure(req, result, time.Second, "Long")
 	approx := func(name string, values []float64, want ...float64) {
 		t.Helper()
 		if len(values) != len(want) {
@@ -445,11 +446,34 @@ func TestMeasure(t *testing.T) {
 	second := (7500 + float64(result.Children[1].Children[1].Children[2].Stats.ElapsedMs)) / 5 / 1000
 	approx("cycle stretch", got.cycleStretches, first, second)
 	// Without a cycle length there is no stretch, and rates still come out.
-	if again := measure(req, result, 0); len(again.cycleStretches) != 0 || len(again.burnPerCoreSecond) != 2 {
+	if again := measure(req, result, 0, "Long"); len(again.cycleStretches) != 0 || len(again.burnPerCoreSecond) != 2 {
 		t.Errorf("measure without a cycle = %+v", again)
 	}
+	// Each leaf becomes a row named by kind and action, with its sums
+	// spread back over its passes: the burn ran 5 times for 1s each, the
+	// writes 5 times for 500ms moving 4 MiB each. The working-set leaf had
+	// no elapsed and yields no row.
+	byName := map[string][]leafRow{}
+	for _, row := range got.rows {
+		byName[row.name] = append(byName[row.name], row)
+	}
+	wantNames := []string{"BurnLong", "DiskWriteLong", "RAMChurnLong", "DiskReadLong", "RAMWalkLong", "SleepLong"}
+	for _, name := range wantNames {
+		if len(byName[name]) != 2 {
+			t.Errorf("rows named %s = %d, want one per spelled-out cycle", name, len(byName[name]))
+		}
+	}
+	if len(byName) != len(wantNames) {
+		t.Errorf("row names = %v, want exactly %v", slices.Sorted(maps.Keys(byName)), wantNames)
+	}
+	if burn := byName["BurnLong"][0]; burn.count != 5 || burn.latency != time.Second || burn.length != 800 {
+		t.Errorf("BurnLong row = %+v, want 5 passes of 1s at 800 iterations each", burn)
+	}
+	if write := byName["DiskWriteLong"][0]; write.count != 5 || write.latency != 500*time.Millisecond || write.length != 4<<20 {
+		t.Errorf("DiskWriteLong row = %+v, want 5 passes of 500ms moving 4 MiB", write)
+	}
 	// A result shorter than the script (a cut pass) does not panic.
-	measure(req, &gluttonpb.StepResult{Stats: &gluttonpb.Stats{}}, time.Second)
+	measure(req, &gluttonpb.StepResult{Stats: &gluttonpb.Stats{}}, time.Second, "Long")
 }
 
 // Ticks fall at epoch+phase and every interval after; the next one is

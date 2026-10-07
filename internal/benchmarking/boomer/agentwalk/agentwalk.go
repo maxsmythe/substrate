@@ -90,8 +90,8 @@ const (
 const (
 	wakeMetric      = "WakeFirstTouch"
 	thinkMetric     = "LLMThink"
-	shortMetric     = "ComputeShort"
-	longMetric      = "ComputeLong"
+	shortMetric     = "ShortAction"
+	longMetric      = "LongAction"
 	sessionMetric   = "SessionLength"
 	dormantMetric   = "DormantLength"
 	idleCPUMetric   = "SetIdleCPU"
@@ -412,12 +412,12 @@ func (u *agent) step(ctx context.Context) {
 		u.queryLLM(ctx, knobs)
 	case actionShort:
 		length := knobs.shortDuration(u.rng)
-		u.compute(ctx, shortMetric, shortScript(length, knobs.shortCores(u.rng)), length, 0)
+		u.compute(ctx, shortMetric, "Short", shortScript(length, knobs.shortCores(u.rng)), length, 0)
 	case actionLong:
 		mix := knobs.drawLongMix(u.rng)
 		length := knobs.longDuration(u.rng)
 		observeMix(mix)
-		u.compute(ctx, longMetric, knobs.longScript(mix, length, u.rng), length, knobs.longCycle)
+		u.compute(ctx, longMetric, "Long", knobs.longScript(mix, length, u.rng), length, knobs.longCycle)
 	case actionDone:
 		u.endSession(ctx, nil)
 	}
@@ -494,11 +494,13 @@ func (u *agent) queryLLM(ctx context.Context, knobs params) {
 }
 
 // compute runs one RunScript against the actor and reports its wall time
-// under name, and the rates of its leaves to the contention histograms;
-// cycle is the nominal cycle length for a long operation's stretch, zero
-// for a script without cycles. The request is bounded by the script's
-// planned length plus slack, on a client with no timeout of its own.
-func (u *agent) compute(ctx context.Context, name string, script *gluttonpb.RunScriptRequest, planned, cycle time.Duration) {
+// under name, each of its leaves as a row named by request kind and
+// action (DiskWriteLong, BurnShort), and the leaves' rates to the
+// contention histograms; cycle is the nominal cycle length for a long
+// operation's stretch, zero for a script without cycles. The request is
+// bounded by the script's planned length plus slack, on a client with no
+// timeout of its own.
+func (u *agent) compute(ctx context.Context, name, action string, script *gluttonpb.RunScriptRequest, planned, cycle time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, planned+scriptSlack)
 	defer cancel()
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
@@ -519,7 +521,7 @@ func (u *agent) compute(ctx context.Context, name string, script *gluttonpb.RunS
 		return
 	}
 	u.noteSuccess()
-	measure(script, resp.GetResult(), cycle).observe()
+	measure(script, resp.GetResult(), cycle, action).observe()
 	bmetrics.RecordSuccess(methodHTTP, name, userClass, latency, resp.GetResult().GetStats().GetRequestsRun())
 }
 
