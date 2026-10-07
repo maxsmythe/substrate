@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/boomerutil"
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/dynconfig"
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
 	"github.com/agent-substrate/substrate/internal/benchmarking/glutton"
@@ -322,31 +323,32 @@ func TestLongScript(t *testing.T) {
 	distinct := map[int64]bool{}
 	for i, step := range loop.GetSteps() {
 		cycle := step.GetBlock()
-		if cycle.GetLoopDurationMs() != 0 || len(cycle.GetSteps()) != 2 {
-			t.Fatalf("cycle %d = %v, want an unlooped block of work then sleep", i, cycle)
+		if cycle.GetLoopDurationMs() != 0 || len(cycle.GetSteps()) != 3 {
+			t.Fatalf("cycle %d = %v, want an unlooped block of writes, reads, then sleep", i, cycle)
 		}
-		work := cycle.GetSteps()[0].GetOperation().GetRequests()
-		if len(work) != 5 {
-			t.Fatalf("cycle %d work has %d requests, want burn, disk write, disk read, ram churn, ram walk", i, len(work))
+		writes := cycle.GetSteps()[0].GetOperation().GetRequests()
+		reads := cycle.GetSteps()[1].GetOperation().GetRequests()
+		if len(writes) != 3 || len(reads) != 2 {
+			t.Fatalf("cycle %d has %d write-side and %d read-side requests, want burn, disk write, ram churn then disk read, ram walk", i, len(writes), len(reads))
 		}
-		burn := work[0].GetBurnCpu()
+		burn := writes[0].GetBurnCpu()
 		if burn.GetParallelism() != 2 || !within(float64(burn.GetDurationMs()), 400) {
 			t.Errorf("cycle %d burn = %v, want 2 goroutines for ~400ms", i, burn)
 		}
 		distinct[burn.GetDurationMs()] = true
-		if write := work[1].GetWriteDisk(); write.GetKey() != diskKey || !within(float64(write.GetSize()), 0.3*(2<<20)) {
+		if write := writes[1].GetWriteDisk(); write.GetKey() != diskKey || !within(float64(write.GetSize()), 0.3*(2<<20)) {
 			t.Errorf("cycle %d disk write = %v, want ~30%% of 2Mi", i, write)
 		}
-		if read := work[2].GetReadDisk(); read.GetKey() != diskKey || read.GetReadMode() != gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY {
-			t.Errorf("cycle %d disk read = %v", i, read)
-		}
-		if churn := work[3].GetWriteRam(); churn.GetKey() != ramKey || churn.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+		if churn := writes[2].GetWriteRam(); churn.GetKey() != ramKey || churn.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
 			t.Errorf("cycle %d ram churn = %v, want a rotate of %s", i, churn, ramKey)
 		}
-		if walk := work[4].GetReadRam(); walk.GetKey() != ramKey || walk.GetSize() != work[3].GetWriteRam().GetSize() {
+		if read := reads[0].GetReadDisk(); read.GetKey() != diskKey || read.GetReadMode() != gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY {
+			t.Errorf("cycle %d disk read = %v", i, read)
+		}
+		if walk := reads[1].GetReadRam(); walk.GetKey() != ramKey || walk.GetSize() != writes[2].GetWriteRam().GetSize() {
 			t.Errorf("cycle %d ram walk = %v, want the churned bytes walked", i, walk)
 		}
-		if sleep := cycle.GetSteps()[1].GetOperation().GetRequests()[0].GetSleep(); !within(float64(sleep.GetDurationMs()), 100) {
+		if sleep := cycle.GetSteps()[2].GetOperation().GetRequests()[0].GetSleep(); !within(float64(sleep.GetDurationMs()), 100) {
 			t.Errorf("cycle %d sleep = %v, want ~100ms", i, sleep)
 		}
 	}
@@ -360,8 +362,8 @@ func TestLongScript(t *testing.T) {
 	// Tiny shares still move something.
 	tiny := knobs.longScript(longMix{shares: [numParts]float64{0.9998, 0.0001, 0.0001, 0}, cores: 1}, 5*time.Second, testRand())
 	work := tiny.GetScript().GetSteps()[1].GetBlock().GetSteps()[0].GetBlock().GetSteps()[0].GetOperation().GetRequests()
-	if work[1].GetWriteDisk().GetSize() < minIOBytes || work[3].GetWriteRam().GetSize() != fmt.Sprint(minIOBytes) {
-		t.Errorf("tiny shares produced disk %d and ram %s, want the %d floor", work[1].GetWriteDisk().GetSize(), work[3].GetWriteRam().GetSize(), minIOBytes)
+	if work[1].GetWriteDisk().GetSize() < minIOBytes || work[2].GetWriteRam().GetSize() != fmt.Sprint(minIOBytes) {
+		t.Errorf("tiny shares produced disk %d and ram %s, want the %d floor", work[1].GetWriteDisk().GetSize(), work[2].GetWriteRam().GetSize(), minIOBytes)
 	}
 }
 
@@ -402,13 +404,16 @@ func TestMeasure(t *testing.T) {
 	// took 1s and its sleep slept exactly what it asked; the second's
 	// sleep overslept by half.
 	cycleResult := func(cycleIndex int, oversleep float64) *gluttonpb.StepResult {
-		askedMs := req.GetScript().GetSteps()[1].GetBlock().GetSteps()[cycleIndex].GetBlock().GetSteps()[1].GetOperation().GetRequests()[0].GetSleep().GetDurationMs()
+		askedMs := req.GetScript().GetSteps()[1].GetBlock().GetSteps()[cycleIndex].GetBlock().GetSteps()[2].GetOperation().GetRequests()[0].GetSleep().GetDurationMs()
 		slept := int64(float64(askedMs) * 5 * oversleep)
-		work := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 5000, Passes: 5}, Children: []*gluttonpb.StepResult{
-			leaf("burn", 5000, 5), leaf("write", 2500, 5), leaf("read", 2500, 5), leaf("churn", 2500, 5), leaf("walk", 2500, 5),
+		writes := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 5000, Passes: 5}, Children: []*gluttonpb.StepResult{
+			leaf("burn", 5000, 5), leaf("write", 2500, 5), leaf("churn", 2500, 5),
+		}}
+		reads := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 2500, Passes: 5}, Children: []*gluttonpb.StepResult{
+			leaf("read", 2500, 5), leaf("walk", 2500, 5),
 		}}
 		sleep := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: slept, Passes: 5}, Children: []*gluttonpb.StepResult{leaf("sleep", slept, 5)}}
-		return &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 5000 + slept, Passes: 5}, Children: []*gluttonpb.StepResult{work, sleep}}
+		return &gluttonpb.StepResult{Stats: &gluttonpb.Stats{ElapsedMs: 7500 + slept, Passes: 5}, Children: []*gluttonpb.StepResult{writes, reads, sleep}}
 	}
 	result := &gluttonpb.StepResult{Stats: &gluttonpb.Stats{Passes: 1}, Children: []*gluttonpb.StepResult{
 		{Stats: &gluttonpb.Stats{Passes: 1}, Children: []*gluttonpb.StepResult{stats(0, 1, nil)}}, // working set, fake-like: no elapsed
@@ -436,8 +441,8 @@ func TestMeasure(t *testing.T) {
 	approx("ram walk MiB/s", got.ramWalkMiBps, 16, 16)
 	approx("sleep ratio", got.sleepRatios, 1, 1.5)
 	// Stretch is each cycle's elapsed per pass over the 1s nominal cycle.
-	first := (5000 + float64(result.Children[1].Children[0].Children[1].Stats.ElapsedMs)) / 5 / 1000
-	second := (5000 + float64(result.Children[1].Children[1].Children[1].Stats.ElapsedMs)) / 5 / 1000
+	first := (7500 + float64(result.Children[1].Children[0].Children[2].Stats.ElapsedMs)) / 5 / 1000
+	second := (7500 + float64(result.Children[1].Children[1].Children[2].Stats.ElapsedMs)) / 5 / 1000
 	approx("cycle stretch", got.cycleStretches, first, second)
 	// Without a cycle length there is no stretch, and rates still come out.
 	if again := measure(req, result, 0); len(again.cycleStretches) != 0 || len(again.burnPerCoreSecond) != 2 {
@@ -593,7 +598,7 @@ func TestWakeFailureKeepsActorThroughRouterCapacityErrors(t *testing.T) {
 
 // 404 from the router means the actor record is gone: replace at once.
 func TestWakeFailureReplacesActorOnRouterNotFound(t *testing.T) {
-	walker := newTestAgent(t, &fake.Server{Status: http.StatusNotFound}, &fakeControlClient{}, testKnobs(nil))
+	walker := newTestAgent(t, &fake.Server{Status: http.StatusNotFound, StatusBody: "actor benchmark/walk-test not found"}, &fakeControlClient{}, testKnobs(nil))
 	walker.step(context.Background())
 	if !walker.broken {
 		t.Error("broken = false after a 404 wake; want immediate replacement")
@@ -742,6 +747,31 @@ func countCalls(calls []string, name string) int {
 		}
 	}
 	return n
+}
+
+// A 404 replaces the actor only when it is the router saying the actor is
+// gone; glutton maps a missing file inside a script to 404 too, and that
+// actor is fine.
+func TestClassifyHTTP(t *testing.T) {
+	const actor = "benchmark/walk-test"
+	for name, tc := range map[string]struct {
+		status int
+		body   string
+		want   boomerutil.FailureAction
+	}{
+		"router actor gone":    {404, "actor benchmark/walk-test not found", boomerutil.ReplaceNow},
+		"glutton missing file": {404, `script.steps[1].block.steps[0].block.steps[1].operation.requests[0] (read_disk): file "agentwalk_scratch" not found`, boomerutil.ReplaceIfPersistent},
+		"busy":                 {503, "actor benchmark/walk-test unavailable: no free workers", boomerutil.RetryLater},
+		"gateway timeout":      {504, "", boomerutil.RetryLater},
+		"glutton bad request":  {400, "op 0 (write_disk): key must match", boomerutil.ReplaceIfPersistent},
+		"server error":         {500, "", boomerutil.ReplaceIfPersistent},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := classifyHTTP(tc.status, tc.body, actor); got != tc.want {
+				t.Errorf("classifyHTTP(%d, %q) = %v, want %v", tc.status, tc.body, got, tc.want)
+			}
+		})
+	}
 }
 
 // fakeClock stands in for time in waitForTick: sleep advances it.

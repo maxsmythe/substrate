@@ -484,9 +484,12 @@ func (p params) longScript(mix longMix, length time.Duration, rng *rand.Rand) *g
 	}})
 }
 
-// cycleStep is one jittered cycle of a long operation, as a block of the
-// concurrent work followed by the idle sleep, so its result node reports
-// the cycle's own elapsed time.
+// cycleStep is one jittered cycle of a long operation, as a block of three
+// steps: the CPU burn alongside the disk and RAM writes, then the disk and
+// RAM reads, then the idle sleep. The reads follow the writes rather than
+// run beside them because an operation's requests run at the same time,
+// and on an actor's first cycle the scratch file does not exist until its
+// write lands. The block's result node reports the cycle's own elapsed time.
 func (p params) cycleStep(mix longMix, rng *rand.Rand) *gluttonpb.Step {
 	jitter := func() float64 { return 1 + p.longJitter*(2*rng.Float64()-1) }
 	cycle := float64(p.longCycle)
@@ -494,20 +497,22 @@ func (p params) cycleStep(mix longMix, rng *rand.Rand) *gluttonpb.Step {
 	idle := time.Duration(mix.shares[resIdle] * cycle * jitter())
 	diskBytes := max(minIOBytes, int64(mix.shares[resDisk]*float64(p.longMaxDisk)*jitter()))
 	ramBytes := max(minIOBytes, int64(mix.shares[resRAM]*float64(p.longMaxRAM)*jitter()))
-	work := operation(
+	writes := operation(
 		burnRequest(burn, mix.cores),
 		&gluttonpb.Request{Kind: &gluttonpb.Request_WriteDisk{WriteDisk: &gluttonpb.WriteDiskRequest{
 			Key: diskKey, Size: int32(min(diskBytes, math.MaxInt32)), WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE}}},
-		&gluttonpb.Request{Kind: &gluttonpb.Request_ReadDisk{ReadDisk: &gluttonpb.ReadDiskRequest{
-			Key: diskKey, ReadMode: gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY}}},
 		// Rotate moves the dirty window through the working set cycle over
 		// cycle instead of re-dirtying the same prefix.
 		writeRAMRequest(ramBytes, gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE),
+	)
+	reads := operation(
+		&gluttonpb.Request{Kind: &gluttonpb.Request_ReadDisk{ReadDisk: &gluttonpb.ReadDiskRequest{
+			Key: diskKey, ReadMode: gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY}}},
 		&gluttonpb.Request{Kind: &gluttonpb.Request_ReadRam{ReadRam: &gluttonpb.ReadRAMRequest{
 			Key: ramKey, Size: fmt.Sprintf("%d", ramBytes)}}},
 	)
 	return &gluttonpb.Step{Kind: &gluttonpb.Step_Block{Block: &gluttonpb.Block{
-		Steps: []*gluttonpb.Step{work, operation(sleepRequest(idle))},
+		Steps: []*gluttonpb.Step{writes, reads, operation(sleepRequest(idle))},
 	}}}
 }
 

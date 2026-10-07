@@ -609,16 +609,21 @@ func (e *httpError) Error() string {
 	return fmt.Sprintf("%s: HTTP %d: %s", e.route, e.status, e.body)
 }
 
-// classifyHTTP maps a router status onto a failure action. 503, 504, and
+// classifyHTTP maps a router reply onto a failure action. 503, 504, and
 // 429 are the fleet or the control plane being busy, which a replacement
-// would only add to; 404 means the actor record is gone. Anything else is
-// counted toward replacement, as a non-status error would be.
-func classifyHTTP(status int) boomerutil.FailureAction {
+// would only add to. 404 is two different things: from the router it means
+// the actor record is gone, and its body names the actor; from glutton it
+// is a request inside a script that found no file or array, which its HTTP
+// mode maps to 404 too, and the actor is fine. Anything else is counted
+// toward replacement, as a non-status error would be.
+func classifyHTTP(status int, body, actorRef string) boomerutil.FailureAction {
 	switch status {
 	case http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusTooManyRequests:
 		return boomerutil.RetryLater
 	case http.StatusNotFound:
-		return boomerutil.ReplaceNow
+		if strings.Contains(body, actorRef) {
+			return boomerutil.ReplaceNow
+		}
 	}
 	return boomerutil.ReplaceIfPersistent
 }
@@ -632,7 +637,7 @@ func (u *agent) noteFailure(err error) {
 	action := boomerutil.ClassifyLifecycleFailure(err)
 	var routerErr *httpError
 	if errors.As(err, &routerErr) {
-		action = classifyHTTP(routerErr.status)
+		action = classifyHTTP(routerErr.status, routerErr.body, u.cfg.Atespace+"/"+u.actorName)
 	}
 	switch action {
 	case boomerutil.ReplaceNow:

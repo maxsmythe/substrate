@@ -344,9 +344,9 @@ corners come up as readily as the middle: the CPU and idle shares are
 fractions of a nominal cycle (`--agentwalk-long-cycle-seconds`), and the
 disk and RAM shares are fractions of the per-cycle byte ceilings. It also
 draws a goroutine count up to `--agentwalk-long-max-cores`. Each cycle
-then runs the CPU burn, a disk write and read of the scratch file, and a
-RAM churn and walk of the working set at the same time, followed by the
-idle sleep, with every intensity jittered independently per cycle by
+then runs the CPU burn alongside a write of the scratch file and a churn of
+the working set, then reads the file back and walks the working set, then
+sleeps the idle share, with every intensity jittered independently per cycle by
 `--agentwalk-long-jitter`; the cycle repeats until the operation's length
 is up. One operation is therefore a consistent shape while the fleet's
 operations differ from one another. Every agent holds
@@ -402,7 +402,8 @@ effect across the fleet without a new swarm.
 * `--agentwalk-template` — ActorTemplate in `benchmark-workloads` to create
   agents from (default `glutton`); applies to agents created after a change.
 * `--resume-mode implicit|explicit` and `--lifecycle-mode suspend|pause` —
-  as for the agent-session benchmark.
+  as for the agent-session benchmark. The locust flag defaults to explicit
+  and the master sends it; pass `implicit` to measure the parked wake.
 
 #### Agent-Walk Reported Metrics
 

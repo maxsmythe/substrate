@@ -58,8 +58,12 @@ type Server struct {
 	// EmptyPayload causes /readdisk to omit the Data field entirely (digest-only wire format).
 	// Silently takes precedence over CorruptPayload if both are set.
 	EmptyPayload bool
-	// Status fails every route with this HTTP status code.
-	Status int
+	// Status fails every route with this HTTP status code, and StatusBody is
+	// the body it sends; empty sends the status text. The router names the
+	// actor in its own 4xx bodies, which is how a driver tells them from a
+	// glutton error carried through.
+	Status     int
+	StatusBody string
 	// ElapsedUs sets the x-server-elapsed-us timing header/trailer.
 	ElapsedUs string
 
@@ -164,7 +168,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	if s.Status != 0 {
-		http.Error(w, http.StatusText(s.Status), s.Status)
+		body := s.StatusBody
+		if body == "" {
+			body = http.StatusText(s.Status)
+		}
+		http.Error(w, body, s.Status)
 		return
 	}
 
