@@ -17,6 +17,7 @@ package agentsession
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -731,7 +732,8 @@ func TestRunStep_ReplacesCrashedActorImmediately(t *testing.T) {
 // a state nothing the driver can call moves the actor out of.
 func TestRunStep_ReplacesStuckActorAfterFailedWake(t *testing.T) {
 	ctl := &fakeControlClient{suspendErrs: []error{status.Error(codes.FailedPrecondition, "MarkSuspending prerequisite not met (got: ACTOR_STATE_CRASHED)")}}
-	u := newTestUser(t, &fake.Server{Status: 503}, ctl, dynconfig.Config{})
+	// A budget that fits one wake attempt: the router never recovers here.
+	u := newTestUser(t, &fake.Server{Status: 503}, ctl, dynconfig.Config{AgentSessionResumeRetryBudget: time.Nanosecond})
 
 	if u.runStep(context.Background(), pingStep) {
 		t.Fatal("runStep = true with a failing router")
@@ -750,7 +752,9 @@ func TestRunStep_KeepsActorThroughCapacityShortage(t *testing.T) {
 		errs[i] = status.Error(codes.ResourceExhausted, "no worker has room for the actor")
 	}
 	ctl := &fakeControlClient{resumeErrs: errs}
-	u := newTestUser(t, &fake.Server{}, ctl, dynconfig.Config{ResumeMode: dynconfig.ResumeModeExplicit})
+	// A budget too short for a second attempt: this test is about the actor
+	// being kept, not about the retry.
+	u := newTestUser(t, &fake.Server{}, ctl, dynconfig.Config{ResumeMode: dynconfig.ResumeModeExplicit, AgentSessionResumeRetryBudget: time.Nanosecond})
 
 	for range rounds {
 		if u.runStep(context.Background(), pingStep) {
@@ -759,6 +763,204 @@ func TestRunStep_KeepsActorThroughCapacityShortage(t *testing.T) {
 	}
 	if u.broken || u.consecutiveFailures != 0 {
 		t.Errorf("broken=%v consecutiveFailures=%d after capacity errors, want false/0", u.broken, u.consecutiveFailures)
+	}
+	if got := countCalls(ctl.recordedCalls(), "ResumeActor"); got != rounds {
+		t.Errorf("ResumeActor calls = %d with a budget that fits one attempt, want %d", got, rounds)
+	}
+}
+
+// A fleet with no room is retried within the budget, as glutton's spawn path
+// does: the step goes through once a slot opens, with one ResumeActor sample
+// per attempt.
+func TestRunStep_RetriesWakeWhileFleetIsFull(t *testing.T) {
+	const full = 3
+	errs := make([]error, full)
+	for i := range errs {
+		errs[i] = status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+	}
+	ctl := &fakeControlClient{resumeErrs: errs}
+	srv := &fake.Server{}
+	u := newTestUser(t, srv, ctl, dynconfig.Config{ResumeMode: dynconfig.ResumeModeExplicit, AgentSessionResumeRetryBudget: 10 * time.Second})
+
+	if !u.runStep(context.Background(), pingStep) {
+		t.Fatal("runStep = false; the resume succeeded within the budget and the step must count")
+	}
+	if got := countCalls(ctl.recordedCalls(), "ResumeActor"); got != full+1 {
+		t.Errorf("ResumeActor calls = %d, want %d failed attempts and one success", got, full+1)
+	}
+	if u.broken || u.consecutiveFailures != 0 {
+		t.Errorf("broken=%v consecutiveFailures=%d, want false/0", u.broken, u.consecutiveFailures)
+	}
+	// The wake ping and the step's one op: nothing reached the actor while
+	// the resume was being retried.
+	if got := len(srv.RecordedPaths()); got != 2 {
+		t.Errorf("actor requests = %d, want 2", got)
+	}
+}
+
+// When the budget runs out the step is given up as before: the actor is
+// kept, nothing counts toward replacement, and the session retries the step
+// after its next think gap.
+func TestRunStep_GivesUpWakeAfterRetryBudget(t *testing.T) {
+	errs := make([]error, 100)
+	for i := range errs {
+		errs[i] = status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+	}
+	ctl := &fakeControlClient{resumeErrs: errs}
+	srv := &fake.Server{}
+	const budget = 200 * time.Millisecond
+	u := newTestUser(t, srv, ctl, dynconfig.Config{ResumeMode: dynconfig.ResumeModeExplicit, AgentSessionResumeRetryBudget: budget})
+
+	start := time.Now()
+	if u.runStep(context.Background(), pingStep) {
+		t.Fatal("runStep = true while every resume fails")
+	}
+	if waited := time.Since(start); waited > budget+wakeRetryMaxBackoff {
+		t.Errorf("runStep took %v, want at most the budget plus one backoff", waited)
+	}
+	attempts := countCalls(ctl.recordedCalls(), "ResumeActor")
+	// Backoff 50ms, 100ms, ... fits two or three waits in 200ms.
+	if attempts < 2 || attempts > 5 {
+		t.Errorf("ResumeActor attempts = %d, want a few within a %v budget", attempts, budget)
+	}
+	if u.broken || u.consecutiveFailures != 0 {
+		t.Errorf("broken=%v consecutiveFailures=%d, want false/0", u.broken, u.consecutiveFailures)
+	}
+	if got := len(srv.RecordedPaths()); got != 0 {
+		t.Errorf("actor requests = %d, want none while the resume never succeeded", got)
+	}
+	if calls := ctl.recordedCalls(); calls[len(calls)-1] == "SuspendActor" {
+		t.Error("SuspendActor issued after a resume that never succeeded")
+	}
+}
+
+// capacityThenServe fails the first n requests with a router capacity status
+// and passes the rest to the actor, the implicit-mode shape of a full fleet.
+type capacityThenServe struct {
+	next   http.RoundTripper
+	status int
+	n      int
+	mu     sync.Mutex
+	failed int
+}
+
+func (c *capacityThenServe) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.mu.Lock()
+	fail := c.failed < c.n
+	if fail {
+		c.failed++
+	}
+	c.mu.Unlock()
+	if !fail {
+		return c.next.RoundTrip(req)
+	}
+	return &http.Response{
+		StatusCode: c.status,
+		Status:     http.StatusText(c.status),
+		Body:       io.NopCloser(strings.NewReader("no worker has room for the actor")),
+		Header:     http.Header{},
+		Request:    req,
+	}, nil
+}
+
+// In implicit mode the capacity error is the router's 503 on the wake ping;
+// it is retried the same way, and the step counts once the ping lands.
+func TestRunStep_RetriesWakePingOnRouterCapacityError(t *testing.T) {
+	srv := &fake.Server{}
+	ctl := &fakeControlClient{}
+	u := newTestUser(t, srv, ctl, dynconfig.Config{AgentSessionResumeRetryBudget: 10 * time.Second})
+	rt := &capacityThenServe{next: u.cfg.HTTPClient.Transport, status: http.StatusServiceUnavailable, n: 2}
+	u.cfg.HTTPClient = &http.Client{Transport: rt}
+
+	if !u.runStep(context.Background(), pingStep) {
+		t.Fatal("runStep = false; the wake ping succeeded within the budget and the step must count")
+	}
+	if rt.failed != 2 {
+		t.Errorf("router failures served = %d, want 2", rt.failed)
+	}
+	// The wake ping that got through and the step's one op.
+	if got := len(srv.RecordedPaths()); got != 2 {
+		t.Errorf("actor requests = %d, want 2", got)
+	}
+	if u.broken || u.consecutiveFailures != 0 {
+		t.Errorf("broken=%v consecutiveFailures=%d, want false/0", u.broken, u.consecutiveFailures)
+	}
+}
+
+func TestIsCapacityError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no room", status.Error(codes.ResourceExhausted, "no worker has room for the actor"), true},
+		{"api server restarting", status.Error(codes.Unavailable, "connection refused"), true},
+		{"router 503", &httpError{route: "/ping", status: http.StatusServiceUnavailable}, true},
+		{"router 504", &httpError{route: "/ping", status: http.StatusGatewayTimeout}, true},
+		{"router 429", &httpError{route: "/ping", status: http.StatusTooManyRequests}, true},
+		{"router 404", &httpError{route: "/ping", status: http.StatusNotFound}, false},
+		{"router 500", &httpError{route: "/ping", status: http.StatusInternalServerError}, false},
+		{"crashed", status.Error(codes.Aborted, "actor benchmark/agent-test crashed"), false},
+		{"deadline", status.Error(codes.DeadlineExceeded, "context deadline exceeded"), false},
+		{"plain error", errors.New("dial tcp: connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		if got := isCapacityError(tc.err); got != tc.want {
+			t.Errorf("%s: isCapacityError = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A capacity error that stops being one is returned at once.
+func TestRetryWhileFull_StopsOnOtherErrors(t *testing.T) {
+	calls := 0
+	boom := errors.New("sandbox exploded")
+	err := retryWhileFull(context.Background(), time.Now().Add(time.Minute), func() error {
+		calls++
+		if calls == 1 {
+			return status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) || calls != 2 {
+		t.Errorf("err=%v calls=%d, want the second error after two calls", err, calls)
+	}
+}
+
+func TestPhaseInDelay(t *testing.T) {
+	r := &runtime{cfg: &userclass.Config{Dyn: dynconfig.NewHolder(dynconfig.Config{})}}
+	if got := r.phaseInDelay(); got != 0 {
+		t.Fatalf("phaseInDelay = %v with no window, want 0", got)
+	}
+
+	const window = 10 * time.Second
+	r.cfg.Dyn.Store(dynconfig.Config{AgentSessionPhaseIn: window})
+	lo, hi := window, time.Duration(0)
+	for range 200 {
+		got := r.phaseInDelay()
+		if got < 0 || got >= window {
+			t.Fatalf("phaseInDelay = %v, want within [0, %v)", got, window)
+		}
+		lo, hi = min(lo, got), max(hi, got)
+	}
+	if hi-lo < window/4 {
+		t.Errorf("200 draws spanned only %v of a %v window; want them spread", hi-lo, window)
+	}
+}
+
+// A VU waits once: a start that failed and is retried does not wait again.
+func TestPhaseInWaitsOnce(t *testing.T) {
+	const window = 40 * time.Millisecond
+	r := &runtime{cfg: &userclass.Config{Dyn: dynconfig.NewHolder(dynconfig.Config{AgentSessionPhaseIn: window})}}
+	r.phaseIn(7)
+	start := time.Now()
+	r.phaseIn(7)
+	if again := time.Since(start); again > window/4 {
+		t.Errorf("second phaseIn waited %v, want none", again)
+	}
+	if _, ok := r.phasedIn.Load(int64(7)); !ok {
+		t.Error("phasedIn does not record the goroutine")
 	}
 }
 
@@ -769,7 +971,9 @@ func TestRunStep_KeepsActorThroughRouterCapacityErrors(t *testing.T) {
 	for _, status := range []int{503, 504, 429} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			ctl := &fakeControlClient{}
-			u := newTestUser(t, &fake.Server{Status: status}, ctl, dynconfig.Config{})
+			// A budget that fits one wake attempt: this test is about the
+			// actor being kept, not about the retry.
+			u := newTestUser(t, &fake.Server{Status: status}, ctl, dynconfig.Config{AgentSessionResumeRetryBudget: time.Nanosecond})
 			for range maxConsecutiveStepFailures + 2 {
 				if u.runStep(context.Background(), pingStep) {
 					t.Fatal("runStep = true with a failing router")

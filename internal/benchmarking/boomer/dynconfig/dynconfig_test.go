@@ -47,6 +47,8 @@ func TestParseValid(t *testing.T) {
 		"sweperf_poll_interval_ms": 100,
 		"agentsession_script": "coding-session",
 		"agentsession_script_file": "/etc/agentsession/script.yaml",
+		"agentsession_phase_in": 300.0,
+		"agentsession_resume_retry_budget": 45.5,
 		"total_actors": 50,
 		"spawn_concurrency": 5,
 		"actor_deadline": 60.0,
@@ -111,6 +113,12 @@ func TestParseValid(t *testing.T) {
 	}
 	if cfg.AgentSessionScriptFile != "/etc/agentsession/script.yaml" {
 		t.Errorf("AgentSessionScriptFile: got %q", cfg.AgentSessionScriptFile)
+	}
+	if cfg.AgentSessionPhaseIn != 5*time.Minute {
+		t.Errorf("AgentSessionPhaseIn: got %v, want 5m", cfg.AgentSessionPhaseIn)
+	}
+	if cfg.AgentSessionResumeRetryBudget != 45500*time.Millisecond {
+		t.Errorf("AgentSessionResumeRetryBudget: got %v, want 45.5s", cfg.AgentSessionResumeRetryBudget)
 	}
 	if cfg.TotalActors != 50 {
 		t.Errorf("TotalActors: got %d, want 50", cfg.TotalActors)
@@ -222,6 +230,14 @@ func TestParseInvalidValues(t *testing.T) {
 		{
 			name: "negative actor deadline",
 			json: `{"actor_deadline": -1.0}`,
+		},
+		{
+			name: "negative agentsession phase-in",
+			json: `{"agentsession_phase_in": -1.0}`,
+		},
+		{
+			name: "negative agentsession resume retry budget",
+			json: `{"agentsession_resume_retry_budget": -1.0}`,
 		},
 	}
 
