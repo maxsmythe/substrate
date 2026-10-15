@@ -23,6 +23,11 @@
 // Per-step timings land in locust stats as Step_<name>. The first request
 // after each suspend is additionally recorded as WakeFirstTouch — in
 // implicit resume mode that row IS the parking wake latency distribution.
+// TimeToWake is the whole wake, from the first ResumeActor attempt to that
+// first request, including the time a session spent retrying while the
+// fleet had no room for its actor (--agentsession-resume-retry-budget).
+// --agentsession-phase-in staggers session starts so a fleet spawned in one
+// ramp does not reach every later step in a single wave.
 package agentsession
 
 import (
@@ -79,6 +84,16 @@ const (
 	// maxConsecutiveStepFailures is how many ReplaceIfPersistent failures in
 	// a row a session tolerates before its actor is deleted and recreated.
 	maxConsecutiveStepFailures = 3
+
+	// defaultResumeRetryBudget is how long a step keeps retrying a wake the
+	// fleet had no room for when --agentsession-resume-retry-budget is unset.
+	defaultResumeRetryBudget = 60 * time.Second
+	// The backoff between wake retries, as in glutton's spawn path: short
+	// enough that a slot freed by another session's suspend is taken within
+	// a second, with jitter so a wave of waiters does not retry in step.
+	wakeRetryInitialBackoff = 50 * time.Millisecond
+	wakeRetryMaxBackoff     = time.Second
+	wakeRetryJitter         = 5 * time.Millisecond
 )
 
 // burnRate is the per-goroutine sha256 iteration rate BurnCPU reports.
@@ -137,6 +152,9 @@ func makeIngestBuf(steps []Step) []byte {
 type runtime struct {
 	cfg   *userclass.Config
 	users sync.Map // goroutineID -> *sessionUser
+	// phasedIn holds the goroutines that have served their phase-in wait,
+	// so a start that failed and is retried does not wait a second time.
+	phasedIn sync.Map // goroutineID -> struct{}
 
 	// loaded is what the knobs currently select, resolved by loadScript when
 	// a session starts and re-resolved when the knobs name something else or
@@ -300,6 +318,32 @@ func (r *runtime) think(s Step) time.Duration {
 	return time.Duration(float64(s.Think) * scale * jitter)
 }
 
+// phaseIn makes a VU that has no session yet wait its share of
+// --agentsession-phase-in before it starts one. Locust spawns the fleet in
+// one ramp and every session begins at step 1, so without it the sessions
+// reach each later step together, in a wave the spawn ramp alone spreads
+// over seconds: with a step that dwells for longer than that, the wave
+// asks every worker for more slots at once than it has. The wait is drawn
+// once per VU; a start that fails and is retried does not wait again.
+func (r *runtime) phaseIn(gid int64) {
+	if _, done := r.phasedIn.LoadOrStore(gid, struct{}{}); done {
+		return
+	}
+	if d := r.phaseInDelay(); d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// phaseInDelay draws one VU's wait: uniform in [0, --agentsession-phase-in),
+// or none when the window is unset.
+func (r *runtime) phaseInDelay() time.Duration {
+	window := r.cfg.Dyn.Load().AgentSessionPhaseIn
+	if window <= 0 {
+		return 0
+	}
+	return time.Duration(mathrand.Int64N(int64(window)))
+}
+
 // iterate is the boomer task function: one scripted step per call. The VU's
 // session is created lazily on first use and wraps back to step 1 after the
 // script completes, so one actor keeps producing suspend/resume cycles for
@@ -308,6 +352,7 @@ func (r *runtime) iterate() {
 	gid := boomerutil.GoroutineID()
 	val, loaded := r.users.Load(gid)
 	if !loaded {
+		r.phaseIn(gid)
 		loaded, err := r.loadScript()
 		if err != nil {
 			slog.Error("agentsession: cannot load script; goroutine will retry next iter",
@@ -517,25 +562,39 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) bool {
 		return false
 	}
 
+	// The wake, from the first attempt to the ping that finds the actor
+	// serving, is one TimeToWake sample. A fleet with no room for the actor
+	// is retried within the budget, so the wait for a slot lands in that row
+	// as latency instead of vanishing into failed rows and a skipped step.
+	wakeStart := time.Now()
+	deadline := wakeStart.Add(u.resumeRetryBudget())
 	if u.cfg.Dyn.Load().ResumeMode == dynconfig.ResumeModeExplicit {
-		if err := u.resume(ctx); err != nil {
+		if err := retryWhileFull(ctx, deadline, func() error { return u.resume(ctx) }); err != nil {
 			u.noteFailure(err)
+			u.recordTimeToWake(wakeStart, err)
+			if isCapacityError(err) {
+				slog.Warn("agent session found no room within the retry budget",
+					slog.String("actor", u.actorName),
+					slog.String("step", step.Name),
+					slog.Duration("waited", time.Since(wakeStart)),
+					slog.String("err", err.Error()))
+			}
 			return false
 		}
 	}
 
-	wakeStart := time.Now()
-	if err := u.execOp(ctx, ping()); err != nil {
+	if err := retryWhileFull(ctx, deadline, func() error { return u.wakePing(ctx) }); err != nil {
 		u.noteFailure(err)
-		bmetrics.RecordFailure("http", "WakeFirstTouch", agentSessionUserClass, time.Since(wakeStart), err.Error())
+		u.recordTimeToWake(wakeStart, err)
 		slog.Warn("agent session wake failed",
 			slog.String("actor", u.actorName),
 			slog.String("step", step.Name),
+			slog.Duration("waited", time.Since(wakeStart)),
 			slog.String("err", err.Error()))
 		u.hibernate(ctx)
 		return false
 	}
-	bmetrics.RecordSuccess("http", "WakeFirstTouch", agentSessionUserClass, time.Since(wakeStart), 0)
+	u.recordTimeToWake(wakeStart, nil)
 
 	metricName := "Step_" + step.Name
 	stepStart := time.Now()
@@ -557,6 +616,80 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) bool {
 
 	u.hibernate(ctx)
 	return true
+}
+
+// wakePing sends the ping that measures the wake, recorded as a
+// WakeFirstTouch sample of its own: in explicit resume mode the round trip
+// after ResumeActor returned, in implicit mode the parked request itself.
+func (u *sessionUser) wakePing(ctx context.Context) error {
+	start := time.Now()
+	if err := u.execOp(ctx, ping()); err != nil {
+		bmetrics.RecordFailure("http", "WakeFirstTouch", agentSessionUserClass, time.Since(start), err.Error())
+		return err
+	}
+	bmetrics.RecordSuccess("http", "WakeFirstTouch", agentSessionUserClass, time.Since(start), 0)
+	return nil
+}
+
+// recordTimeToWake books one step's wake as a TimeToWake sample: the time
+// from the first ResumeActor attempt (in implicit mode, the first wake ping)
+// to the ping that found the actor serving, retries included.
+func (u *sessionUser) recordTimeToWake(start time.Time, err error) {
+	if err != nil {
+		bmetrics.RecordFailure("summary", "TimeToWake", agentSessionUserClass, time.Since(start), err.Error())
+		return
+	}
+	bmetrics.RecordSuccess("summary", "TimeToWake", agentSessionUserClass, time.Since(start), 0)
+}
+
+// resumeRetryBudget is how long a step keeps retrying a wake the fleet had
+// no room for; the knob's zero value reads as the default.
+func (u *sessionUser) resumeRetryBudget() time.Duration {
+	if b := u.cfg.Dyn.Load().AgentSessionResumeRetryBudget; b > 0 {
+		return b
+	}
+	return defaultResumeRetryBudget
+}
+
+// retryWhileFull runs call and, while it fails with a capacity error and
+// the next attempt would still land before deadline, waits with exponential
+// backoff and runs it again. Each attempt records its own sample inside
+// call, as glutton's spawn path does. Any other error returns at once.
+func retryWhileFull(ctx context.Context, deadline time.Time, call func() error) error {
+	delay := wakeRetryInitialBackoff
+	for {
+		err := call()
+		if err == nil || !isCapacityError(err) {
+			return err
+		}
+		wait := delay + time.Duration(mathrand.Float64()*float64(wakeRetryJitter))
+		if time.Now().Add(wait).After(deadline) {
+			return err
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return err
+		}
+		delay = min(delay*2, wakeRetryMaxBackoff)
+	}
+}
+
+// isCapacityError reports whether err says the fleet or the control plane
+// had no room for the actor just now: ateapi's ResourceExhausted ("no
+// worker has room for the actor") or Unavailable, or the router's 503, 504
+// and 429 faces of them. The actor itself is fine, and the next try may find
+// a slot another session's suspend has freed.
+func isCapacityError(err error) bool {
+	var he *httpError
+	if errors.As(err, &he) {
+		return classifyHTTP(he.status) == boomerutil.RetryLater
+	}
+	switch status.Code(err) {
+	case codes.ResourceExhausted, codes.Unavailable:
+		return true
+	}
+	return false
 }
 
 // execOp performs one scripted op as a glutton RPC through the router.
@@ -742,7 +875,11 @@ func (u *sessionUser) resume(ctx context.Context) error {
 		if boomerutil.IsCrashed(err) {
 			bmetrics.RecordFailure("actor", "CrashCount", agentSessionUserClass, 0, "actor entered ACTOR_STATE_CRASHED")
 		}
-		slog.Error("ResumeActor failed", slog.String("actor", u.actorName), slog.String("err", err.Error()))
+		// A full fleet is retried by the caller and reported once when the
+		// budget runs out; a line per attempt would flood the log.
+		if !isCapacityError(err) {
+			slog.Error("ResumeActor failed", slog.String("actor", u.actorName), slog.String("err", err.Error()))
+		}
 	}
 	return err
 }

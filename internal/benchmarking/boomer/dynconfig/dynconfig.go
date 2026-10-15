@@ -81,6 +81,15 @@ type Config struct {
 	AgentSessionScript     string  // built-in agent-session script variant; "" falls back to the default
 	AgentSessionScriptFile string  // path to a script YAML on the worker; wins over AgentSessionScript when set
 	AgentSessionThinkScale float64 // multiplier on the script's per-step think times; 0 reads as 1.0
+	// AgentSessionPhaseIn spreads session starts: each VU waits a uniform
+	// random share of it before creating its actor, so a fleet does not
+	// move through the script in lockstep waves; 0 starts every session at
+	// once.
+	AgentSessionPhaseIn time.Duration
+	// AgentSessionResumeRetryBudget bounds how long a step keeps retrying
+	// a wake the fleet had no room for before it gives up on the step; 0
+	// reads as the agentsession default.
+	AgentSessionResumeRetryBudget time.Duration
 
 	TotalActors      int           // spawn batch size; 0 keeps --total-actors
 	SpawnConcurrency int           // actors the spawn batch creates concurrently; 0 keeps --spawn-concurrency
@@ -141,6 +150,9 @@ type payload struct {
 	AgentSessionScript     *string  `json:"agentsession_script"`
 	AgentSessionScriptFile *string  `json:"agentsession_script_file"`
 	AgentSessionThinkScale *float64 `json:"agentsession_think_scale"`
+	// Seconds, like actor_deadline.
+	AgentSessionPhaseIn           *float64 `json:"agentsession_phase_in"`
+	AgentSessionResumeRetryBudget *float64 `json:"agentsession_resume_retry_budget"`
 
 	TotalActors      *float64 `json:"total_actors"`
 	SpawnConcurrency *float64 `json:"spawn_concurrency"`
@@ -249,6 +261,12 @@ func (c Config) Validate() error {
 	if c.AgentSessionThinkScale < 0 {
 		return fmt.Errorf("agentsession_think_scale cannot be negative: %f", c.AgentSessionThinkScale)
 	}
+	if c.AgentSessionPhaseIn < 0 {
+		return fmt.Errorf("agentsession_phase_in cannot be negative: %v", c.AgentSessionPhaseIn)
+	}
+	if c.AgentSessionResumeRetryBudget < 0 {
+		return fmt.Errorf("agentsession_resume_retry_budget cannot be negative: %v", c.AgentSessionResumeRetryBudget)
+	}
 	if c.TotalActors < 0 {
 		return fmt.Errorf("total_actors cannot be negative: %d", c.TotalActors)
 	}
@@ -345,6 +363,12 @@ func (p payload) merge(current Config) Config {
 	if p.AgentSessionThinkScale != nil {
 		out.AgentSessionThinkScale = *p.AgentSessionThinkScale
 	}
+	if p.AgentSessionPhaseIn != nil {
+		out.AgentSessionPhaseIn = time.Duration(*p.AgentSessionPhaseIn * float64(time.Second))
+	}
+	if p.AgentSessionResumeRetryBudget != nil {
+		out.AgentSessionResumeRetryBudget = time.Duration(*p.AgentSessionResumeRetryBudget * float64(time.Second))
+	}
 	if p.TotalActors != nil {
 		out.TotalActors = int(*p.TotalActors)
 	}
@@ -438,6 +462,8 @@ func StartPoll(
 					slog.String("agentsession_script", next.AgentSessionScript),
 					slog.String("agentsession_script_file", next.AgentSessionScriptFile),
 					slog.Float64("agentsession_think_scale", next.AgentSessionThinkScale),
+					slog.Duration("agentsession_phase_in", next.AgentSessionPhaseIn),
+					slog.Duration("agentsession_resume_retry_budget", next.AgentSessionResumeRetryBudget),
 					slog.Int("total_actors", next.TotalActors),
 					slog.Int("spawn_concurrency", next.SpawnConcurrency),
 					slog.Duration("actor_deadline", next.ActorDeadline),
@@ -494,6 +520,8 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.String("agentsession_script", next.AgentSessionScript),
 			slog.String("agentsession_script_file", next.AgentSessionScriptFile),
 			slog.Float64("agentsession_think_scale", next.AgentSessionThinkScale),
+			slog.Duration("agentsession_phase_in", next.AgentSessionPhaseIn),
+			slog.Duration("agentsession_resume_retry_budget", next.AgentSessionResumeRetryBudget),
 			slog.Int("total_actors", next.TotalActors),
 			slog.Int("spawn_concurrency", next.SpawnConcurrency),
 			slog.Duration("actor_deadline", next.ActorDeadline),

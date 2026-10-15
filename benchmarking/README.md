@@ -250,6 +250,19 @@ deployment fails loudly instead of showing up as OOM-flaky steps.
 * `--agentsession-think-scale` — multiplier on every think gap; 0.5 makes the
   fleet twice as chatty, 4.0 models slow reasoning models (default 1.0). Each
   gap gets ±20% jitter so sessions don't move in lockstep.
+* `--agentsession-phase-in` — seconds over which session starts are spread:
+  each user waits a uniform random share of it before creating its actor
+  (default 0, every session starts at once). Locust's ramp spreads the fleet
+  over seconds and every session begins at step 1, so without it the
+  sessions reach each later step together; a step that dwells longer than
+  the ramp then asks every worker for more slots at once than it has. Set
+  it to a few think gaps for density runs.
+* `--agentsession-resume-retry-budget` — seconds a step keeps retrying a
+  wake the fleet had no room for (ResumeActor `ResourceExhausted` or
+  `Unavailable`, router 503/504/429) with 50ms-to-1s backoff before giving
+  the step up until its next think gap (default 60). Each attempt is its own
+  `ResumeActor` or `WakeFirstTouch` sample; the whole wait lands in
+  `TimeToWake`.
 * `--resume-mode implicit|explicit` — implicit (default) lets the parked
   first request wake the actor; explicit issues ResumeActor before traffic.
 * `--lifecycle-mode suspend|pause` — durable suspend (default) or node-local
@@ -351,6 +364,11 @@ To go back to a built-in variant, redeploy without the flag.
 * `WakeFirstTouch`: latency of a dedicated ping sent before each step's ops —
   in implicit mode that ping is what triggers the parked wake, so this row
   **is** the user-visible wake latency, unpolluted by the step's own work.
+* `TimeToWake`: the whole wake, from the first `ResumeActor` attempt (in
+  implicit mode, the first wake ping) to the ping that found the actor
+  serving, including every retry while the fleet had no room. Equal to
+  `WakeFirstTouch` plus `ResumeActor` when the first attempt went through;
+  a failed row is a step given up after `--agentsession-resume-retry-budget`.
 * `Step_<name>` (e.g. `Step_06_first_build`): wall time of that step's ops,
   think gap excluded.
 * `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane
