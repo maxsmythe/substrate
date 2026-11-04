@@ -578,6 +578,11 @@ def main() -> None:
     tests = yaml.safe_load(Path(args.tests).read_text())["tests"]
     try:
         tests = select_tests(tests, args.test_name)
+        # Experimentation branch: tag every run so its results stand apart
+        # from the baseline. Applied after select_tests so --test-name still
+        # matches the names as written in tests.yaml.
+        for t in tests:
+            t["name"] = f"prepatch_{t['name']}"
         print(f"Running {len(tests)} test(s)", flush=True)
         validate_and_normalize_tests(tests)
         # Checks BENCHMARK_METADATA only; cluster vars may not be set yet.
